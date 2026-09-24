@@ -396,6 +396,7 @@ class OrnixPipeline:
             build_inventory,
             classify_profile,
             effective_env_snapshot,
+            split_allowed,
         )
         from .ops.checkpoint import Checkpoint
         from .util.jsonl import read_jsonl
@@ -420,7 +421,7 @@ class OrnixPipeline:
         splits = adapter.download_cfg.allow_splits
         by_path: Dict[str, SourceRecord] = {}
         for r in eligible:
-            if splits and r.source_split and r.source_split not in splits:
+            if not split_allowed(r.source_split, splits):
                 audit.emit("ingest_skip_split", r.source_id, split=r.source_split)
                 continue
             by_path[r.original_file_id] = r
@@ -448,10 +449,28 @@ class OrnixPipeline:
             allow=cfg.allow_patterns, ignore=cfg.ignore_patterns,
             allow_empty=cfg.allow_empty_inventory)
         inventory = [it for it in inventory if it.path_in_repo in by_path]
-        if cfg.allow_patterns or cfg.ignore_patterns:
-            if not inventory:
-                raise RuntimeError(
-                    "patterns matched 0 downloadable files; fail-closed")
+        if not inventory and cfg.allow_empty_inventory is not True:
+            # No-loss: eligible records exist but nothing is downloadable
+            # (patterns match nothing, or a shard-only repo with no loose
+            # audio). Vanishing them silently would lose SourceRecords, so
+            # fail closed. Shard-only repos are a documented FOLLOW_UP:
+            # stage the shard as an artifact instead, out of scope here.
+            missing = sorted(by_path)[:5]
+            raise RuntimeError(
+                f"0 downloadable files for {len(by_path)} eligible record(s) "
+                f"(allow={cfg.allow_patterns} ignore={cfg.ignore_patterns}); "
+                f"fail-closed, e.g. {missing}")
+        if not inventory:
+            # Explicit opt-in to empty: keep records auditable in the manifest
+            # (no-loss) with a reason; downstream QC flags the missing bytes.
+            for r in by_path.values():
+                r.reason_codes = list(r.reason_codes) + ["INVENTORY_EMPTY_SKIPPED"]
+                append_jsonl(paths.source_manifest, r.to_dict())
+                audit.emit("ingest", r.source_id, status=r.ingest_status.value,
+                           rights=r.rights_status.value,
+                           reason="INVENTORY_EMPTY_SKIPPED")
+                records.append(r)
+            return records
         journal = Checkpoint(os.path.join(paths.root, "download_journal.jsonl"),
                              f"dl-{pinned[:12]}")
         # crash recovery without re-download: staged files from a previous

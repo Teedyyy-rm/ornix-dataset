@@ -135,6 +135,18 @@ def matches_patterns(path: str, allow: Optional[List[str]],
     return True
 
 
+def split_allowed(source_split: Optional[str],
+                  allow_splits: Optional[List[str]]) -> bool:
+    """Split pre-filter (before any byte is fetched). Records with an unknown
+    (None) split can never be excluded: filtering what we cannot see would
+    silently drop data."""
+    if not allow_splits:
+        return True
+    if not source_split:
+        return True
+    return source_split in allow_splits
+
+
 def _expected_sha(entry: Any) -> Optional[str]:
     lfs = getattr(entry, "lfs", None) or {}
     oid = (lfs.get("oid") if isinstance(lfs, dict) else getattr(lfs, "oid", None))
@@ -330,6 +342,7 @@ class DownloadMetrics:
     t_verify_stage_s: float = 0.0
     peak_active_downloads: int = 0
     peak_ready_depth: int = 0
+    peak_rss_mb: float = 0.0  # process peak RSS (ru_maxrss), all threads
     retries: int = 0
     http_429: int = 0
     breaker_trips: int = 0
@@ -492,8 +505,11 @@ class HfBatchDownloader:
 
     def _check_disk(self, need_bytes: int) -> None:
         need = need_bytes * 2 + self.cfg.min_free_disk_bytes  # cache blob + staging copy
-        for label, path in (("cache", self.cache_dir or os.getcwd()),
-                            ("staging", self.staging_dir)):
+        cache_dir = (self.cache_dir or os.environ.get("HF_HUB_CACHE")
+                     or (os.path.join(os.environ["HF_HOME"], "hub")
+                         if os.environ.get("HF_HOME") else None)
+                     or os.path.expanduser("~/.cache/huggingface/hub"))
+        for label, path in (("cache", cache_dir), ("staging", self.staging_dir)):
             try:
                 free = shutil.disk_usage(path).free
             except OSError:
@@ -774,6 +790,14 @@ class HfBatchDownloader:
                 self.metrics.breaker_trips = self._gate.trips
                 self.metrics.n_items = len(items)
                 self.metrics.wall_s = time.monotonic() - t_start
+                try:
+                    import resource
+                    # ru_maxrss is KiB on Linux, bytes on macOS
+                    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                    self.metrics.peak_rss_mb = round(
+                        rss / 1024.0 if sys.platform != "darwin" else rss / 1e6, 2)
+                except Exception:
+                    pass
 
         if self._abort is not None:
             exc = self._abort

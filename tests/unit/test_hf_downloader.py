@@ -474,6 +474,16 @@ def test_T11_pattern_filter_before_download_and_empty_fails_closed():
     assert build_inventory(api2, "org/r", "e" * 40) == []
 
 
+def test_T11_split_filter_before_download():
+    from ornix_dataset.ingestion.hf_downloader import split_allowed
+    assert split_allowed("train", ["train"]) is True
+    assert split_allowed("test", ["train"]) is False
+    # unknown split is never excludable (no silent drops)
+    assert split_allowed(None, ["train"]) is True
+    assert split_allowed("", ["train"]) is True
+    assert split_allowed("test", None) is True
+
+
 # --- T12: error taxonomy ---------------------------------------------------------
 
 def test_T12_permanent_errors_never_retried(tmp_path):
