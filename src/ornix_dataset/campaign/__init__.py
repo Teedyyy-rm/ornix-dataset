@@ -1,0 +1,34 @@
+"""Multi-dataset campaign: Campaign → Dataset Job → Batch (MD-001).
+
+One dataset is the active job at a time; inside it, batches move through
+download → QC → publish stages independently. All state is JSON on disk,
+written atomically (see ops + util.io); resume is idempotent and never
+mutates a pinned revision.
+"""
+
+from .models import Batch, BatchStatus, Campaign, DatasetJob, JobStatus, batch_id_for
+from .planning import plan_batches
+from .refs import (
+    canonical_repo_id,
+    default_resolver,
+    is_full_sha,
+    normalize_repo_ref,
+    pin_revision,
+)
+from .store import CampaignStore
+
+__all__ = [
+    "Batch",
+    "BatchStatus",
+    "Campaign",
+    "CampaignStore",
+    "DatasetJob",
+    "JobStatus",
+    "batch_id_for",
+    "canonical_repo_id",
+    "default_resolver",
+    "is_full_sha",
+    "normalize_repo_ref",
+    "pin_revision",
+    "plan_batches",
+]

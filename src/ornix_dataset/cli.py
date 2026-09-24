@@ -210,6 +210,59 @@ def cmd_publish_verify(args) -> int:
     return 0 if res.ok else 3
 
 
+def cmd_campaign_create(args) -> int:
+    from .campaign import CampaignStore, default_resolver
+    from .config import load_yaml
+
+    spec = load_yaml(args.input)
+    if not isinstance(spec, dict):
+        _print({"error": "campaign input must be a mapping"})
+        return 2
+    store = CampaignStore(args.root)
+    try:
+        campaign, outcomes = store.create_campaign(
+            spec.get("name") or spec.get("campaign") or "campaign",
+            spec.get("datasets") or [],
+            destination=spec.get("destination"),
+            publish_approved=bool(spec.get("publish_approved", False)),
+            workspace=spec.get("workspace"),
+            resolver=default_resolver)
+    except ValueError as e:
+        _print({"error": str(e)})
+        return 2
+    _print({"campaign_id": campaign.campaign_id, "root": store.root,
+            "outcomes": outcomes})
+    return 0 if all(o.get("ok") for o in outcomes) else 3
+
+
+def cmd_campaign_status(args) -> int:
+    from .campaign import CampaignStore
+
+    store = CampaignStore(args.root)
+    try:
+        _print(store.status())
+    except FileNotFoundError:
+        _print({"error": f"no campaign in {store.root}"})
+        return 2
+    return 0
+
+
+def cmd_campaign_resume(args) -> int:
+    from .campaign import CampaignStore, default_resolver
+
+    store = CampaignStore(args.root)
+    try:
+        # The resolver retries pins for BLOCKED jobs (failures stay per-job
+        # errors); stored pins are never mutated — drift is only reported.
+        report = store.resume(resolver=default_resolver,
+                              check_remote=bool(args.check_remote))
+    except FileNotFoundError:
+        _print({"error": f"no campaign in {store.root}"})
+        return 2
+    _print(report)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ornix-dataset",
                                 description="Ornix dataset quality & curation (fail-closed)")
@@ -294,6 +347,21 @@ def build_parser() -> argparse.ArgumentParser:
     pv.add_argument("--commit-sha", required=True)
     pv.add_argument("--release-dir", required=True)
     pv.set_defaults(func=cmd_publish_verify)
+
+    cp = sub.add_parser("campaign", help="multi-dataset campaign commands")
+    cpsub = cp.add_subparsers(dest="sub", required=True)
+    cc = cpsub.add_parser("create", help="create campaign + pin dataset revisions")
+    cc.add_argument("--input", required=True, help="campaign YAML/JSON file")
+    cc.add_argument("--root", required=True, help="campaign state directory")
+    cc.set_defaults(func=cmd_campaign_create)
+    cs = cpsub.add_parser("status", help="show campaign jobs and batches")
+    cs.add_argument("--root", required=True)
+    cs.set_defaults(func=cmd_campaign_status)
+    cr = cpsub.add_parser("resume", help="reconcile state; never mutates pins")
+    cr.add_argument("--root", required=True)
+    cr.add_argument("--check-remote", action="store_true",
+                    help="report upstream drift without changing pins")
+    cr.set_defaults(func=cmd_campaign_resume)
     return p
 
 

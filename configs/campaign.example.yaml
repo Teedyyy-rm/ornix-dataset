@@ -1,0 +1,26 @@
+# Multi-dataset campaign input (MD-001).
+# Usage: ornix-dataset campaign create --input configs/campaign.example.yaml --root work/campaigns/demo
+# Revisions are pinned to exact commit SHAs at create time (network needed for
+# branches/tags; full SHAs are used as-is, offline-safe). Resume never changes pins.
+name: demo-campaign
+destination:
+  repo_id: YOUR_ORG/ornix-releases
+  repo_type: dataset
+publish_approved: false
+workspace:
+  max_bytes: 120000000000
+  min_free_bytes: 40000000000
+datasets:
+  # bare id + branch (resolved to SHA at create)
+  - repo: hf-internal-testing/librispeech_asr_dummy
+    revision: main
+    splits: [train, test]
+    rights:
+      rights_status: REDISTRIBUTION_APPROVED
+      redistribution_permitted: true
+      note: public test dataset, redistribution allowed
+  # full URL form also accepted (revision taken from /tree|blob/<rev>/ when present)
+  - repo: https://huggingface.co/datasets/hf-internal-testing/librispeech_asr_dummy
+    revision: main
+  # pinned SHA form (no network needed at create)
+  - repo: hf-internal-testing/librispeech_asr_dummy@5be91486e11a2d616f4ec5db8d3fd248585ac07a
