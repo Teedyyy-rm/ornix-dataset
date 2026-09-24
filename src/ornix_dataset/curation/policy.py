@@ -32,6 +32,12 @@ class PolicyConfig:
     single_speaker_required: bool = False
     release_target: str = "public"  # public | train_only
     accept_severities: List[str] = field(default_factory=lambda: ["N0", "N1"])
+    # Optional perceptual-quality floors (DNSMOS P.835). Left unset by default:
+    # the worker never auto-picks a publish threshold (spec §0.1) — an operator
+    # binds these via calibration. When set, a score below the floor is a hard FAIL.
+    min_quality_sig: Optional[float] = None
+    min_quality_bak: Optional[float] = None
+    min_quality_ovrl: Optional[float] = None
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -133,6 +139,18 @@ class PolicyEngine:
         if not avail.get("quality", False) or ev.quality_status != MeasurementStatus.OK:
             reasons.append("QUALITY_MODEL_UNAVAILABLE")
             return UNKNOWN
+        floors = (("sig", self.config.min_quality_sig, ev.sig),
+                  ("bak", self.config.min_quality_bak, ev.bak),
+                  ("ovrl", self.config.min_quality_ovrl, ev.ovrl))
+        for name, floor, score in floors:
+            if floor is None:
+                continue
+            if score is None:
+                reasons.append(f"QUALITY_{name.upper()}_UNKNOWN")
+                return UNKNOWN
+            if score < floor:
+                reasons.append(f"QUALITY_{name.upper()}_BELOW:{score:.2f}<{floor:.2f}")
+                return FAIL
         return PASS
 
     def _transcript(self, ev, reasons) -> str:

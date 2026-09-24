@@ -1,0 +1,24 @@
+# DEMONSTRATION policy for the FPT FOSD real-run (train_only). Same DSP gates as
+# the pilot, but ALSO requires the real DNSMOS quality model and applies example
+# perceptual floors so the funnel actually discriminates on this corpus. The floor
+# values are illustrative for this evaluation only — they are NOT operator-calibrated
+# publish thresholds (spec §0.1 forbids the worker from certifying those).
+policy_version: ornix-qc-fpt-demo-v1
+release_target: train_only
+required_checks:
+  - has_speech
+  - no_clipping
+  - no_severe_noise_overlap
+  - quality_ok
+  - rights_ok
+
+min_speech_ratio: 0.3
+max_clip_ratio: 0.02
+hiss_overlap_max_severity: N2
+music_overlap_forbidden: false
+single_speaker_required: false
+accept_severities: [N0, N1, N2]
+
+# Illustrative DNSMOS P.835 floors (demonstration only, not certified):
+min_quality_sig: 2.5
+min_quality_ovrl: 2.0

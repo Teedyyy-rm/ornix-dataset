@@ -78,7 +78,8 @@ class SileroVadAdapter(VadAdapter):
     the per-window speech probability, then merges to intervals in analysis-view
     seconds. Threshold/min-duration are tunable per dataset (Silero guidance)."""
 
-    _WIN = 512      # v5 window size at 16 kHz
+    _WIN = 512      # v5 new-samples per step at 16 kHz
+    _CTX = 64       # v5 context samples prepended to each window (model input = 576)
     _SR = 16000
 
     def __init__(self, model_path: Optional[str] = None, weights_sha256: Optional[str] = None,
@@ -124,13 +125,19 @@ class SileroVadAdapter(VadAdapter):
                            license="MIT")
 
     def _probs(self, mono16k: np.ndarray) -> np.ndarray:
+        # Silero v5 consumes 576 samples per step: 64 context samples carried over
+        # from the previous window prepended to 512 new samples. Feeding only the
+        # 512-sample window (no context) makes the model emit ~0 on real speech.
         state = np.zeros((2, 1, 128), dtype=np.float32)
         sr = np.array(self._SR, dtype=np.int64)
+        context = np.zeros(self._CTX, dtype=np.float32)
         out = []
         for i in range(0, len(mono16k) - self._WIN + 1, self._WIN):
-            chunk = mono16k[i:i + self._WIN].astype(np.float32)[None, :]
+            window = mono16k[i:i + self._WIN].astype(np.float32)
+            chunk = np.concatenate([context, window])[None, :]
             prob, state = self._session.run(None, {"input": chunk, "state": state, "sr": sr})
             out.append(float(np.asarray(prob).reshape(-1)[0]))
+            context = window[-self._CTX:]
         return np.asarray(out, dtype=np.float32)
 
     def infer(self, mono: np.ndarray, sr: int) -> List[List[float]]:

@@ -41,6 +41,26 @@ def test_silero_sha_mismatch_fails_closed():
     assert "sha256" in (v.info().reason or "")
 
 
+def test_silero_probs_feed_v5_context_window():
+    """Regression guard for the v5 ONNX contract: each step must feed 576 samples
+    (64 carried-over context + 512 new). Feeding the bare 512-sample window makes
+    the real model emit ~0 on genuine speech and rejects every clip as NO_SPEECH.
+    Uses a stub session so it runs without provisioned weights."""
+
+    widths = []
+
+    class _StubSession:
+        def run(self, _outputs, feeds):
+            widths.append(int(feeds["input"].shape[-1]))
+            return [np.array([[0.9]], dtype=np.float32), feeds["state"]]
+
+    v = SileroVadAdapter.__new__(SileroVadAdapter)
+    v._session = _StubSession()
+    probs = v._probs(np.zeros(SileroVadAdapter._WIN * 3, dtype=np.float32))
+    assert probs.size == 3
+    assert widths == [SileroVadAdapter._WIN + SileroVadAdapter._CTX] * 3
+
+
 @pytest.mark.skipif(not os.path.exists(_DNSMOS), reason="dnsmos weights not provisioned")
 def test_dnsmos_discriminates_clean_from_noisy():
     q = DnsmosAdapter(model_path=_DNSMOS, weights_sha256=_DNSMOS_SHA, license_ack=True)

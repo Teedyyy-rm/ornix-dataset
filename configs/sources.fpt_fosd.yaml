@@ -1,0 +1,15 @@
+# Real-run test source: FPT Open Speech Dataset subset (doof-ferb/fpt_fosd).
+# License on the Hub is CC-BY-4.0 (redistribution allowed WITH attribution), so we
+# declare REDISTRIBUTION_APPROVED here explicitly — the tool never infers this.
+sources:
+  - name: fpt_fosd_sample
+    type: local
+    root: ./work/fpt_fosd_sample
+    source_revision: "doof-ferb/fpt_fosd@e6ff950456ee"
+    probe: true
+    metadata_file: ./work/fpt_fosd_sample/metadata.jsonl
+    rights:
+      rights_status: REDISTRIBUTION_APPROVED
+      redistribution_permitted: true
+      commercial_training_permitted: "true"
+      note: "FPT FOSD, CC-BY-4.0; attribution required"

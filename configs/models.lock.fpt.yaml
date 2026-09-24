@@ -1,0 +1,21 @@
+# Real detectors for the FPT FOSD run: Silero VAD (MIT) + DNSMOS (ONNX) enabled
+# with checksum-pinned weights fetched via scripts/fetch_models.py. license_ack is
+# set true here ONLY because the operator (this run) reviewed the MIT code terms.
+detectors:
+  vad:
+    adapter: silero
+    silero:
+      model_path: ./work/models/silero_vad.onnx
+      weights_sha256: "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
+  noise:
+    adapter: dsp
+  music:
+    adapter: null
+  quality:
+    adapter: dnsmos
+    dnsmos:
+      model_path: ./work/models/dnsmos_p835.onnx
+      weights_sha256: "269fbebdb513aa23cddfbb593542ecc540284a91849ac50516870e1ac78f6edd"
+      license_ack: true
+  speaker:
+    adapter: pyannote
