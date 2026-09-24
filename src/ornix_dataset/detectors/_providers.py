@@ -34,8 +34,25 @@ def make_session(model_path: str, sess_options=None):
     driver/cuDNN combinations even though CUDA is otherwise usable. Rather than
     letting that take the whole detector UNAVAILABLE, retry CPU-only so the model
     still runs — other models (e.g. DNSMOS) keep using the GPU.
+
+    For CPU data-parallelism, ``ORNIX_ORT_INTRA_THREADS`` caps each session's
+    intra-op thread pool. Small models (Silero/DNSMOS) scale poorly with many
+    intra-op threads, so running many single-/few-threaded workers in parallel is
+    far faster than one many-threaded session — the cap prevents N workers from
+    each grabbing all cores and thrashing.
     """
     import onnxruntime as ort
+
+    if sess_options is None:
+        cap = os.environ.get("ORNIX_ORT_INTRA_THREADS")
+        if cap:
+            try:
+                n = max(1, int(cap))
+                sess_options = ort.SessionOptions()
+                sess_options.intra_op_num_threads = n
+                sess_options.inter_op_num_threads = 1
+            except Exception:
+                sess_options = None
 
     providers = onnx_providers()
     try:

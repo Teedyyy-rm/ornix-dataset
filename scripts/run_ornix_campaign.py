@@ -26,10 +26,16 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
+
+# Guards shared writes (progress log + checkpoint) when datasets run on a worker
+# pool. Canonical export serializes itself via an flock on the identity state, so
+# it needs no lock here; only these in-process shared files do.
+_IO_LOCK = threading.Lock()
 
 
 def _yaml():
@@ -51,9 +57,10 @@ def free_gib(path):
 def log(state_dir, event):
     event = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **event}
     line = json.dumps(event, ensure_ascii=False)
-    with open(os.path.join(state_dir, "progress.log"), "a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
-    print(line, flush=True)
+    with _IO_LOCK:
+        with open(os.path.join(state_dir, "progress.log"), "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+        print(line, flush=True)
 
 
 def load_ckpt(state_dir):
@@ -67,9 +74,10 @@ def load_ckpt(state_dir):
 def save_ckpt(state_dir, ckpt):
     p = os.path.join(state_dir, "campaign_state.json")
     tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(ckpt, fh, ensure_ascii=False, indent=2)
-    os.replace(tmp, p)
+    with _IO_LOCK:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(ckpt, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, p)
 
 
 def run(cmd, env=None):
@@ -366,15 +374,45 @@ def cmd_run(args):
             env["LD_LIBRARY_PATH"] = os.pathsep.join(libdirs + ([existing] if existing else []))
     except Exception:
         pass
+    # CPU throughput: the ONNX detectors scale poorly with intra-op threads (a
+    # single qc process plateaus ~2 clips/s no matter the core count), so we run
+    # several dataset pipelines in parallel and cap each worker's thread pools to
+    # avoid oversubscribing the box. Canonical export serializes across workers on
+    # its own flock; only the checkpoint + progress log need the in-process lock.
+    if args.workers > 1:
+        cap = str(max(1, args.ort_threads))
+        env["ORNIX_ORT_INTRA_THREADS"] = cap
+        for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                  "NUMEXPR_NUM_THREADS"):
+            env[v] = cap
     ckpt = load_ckpt(args.state)
     datasets = man["datasets"]
     if args.only:
         wanted = set(args.only.split(","))
         datasets = [d for d in datasets if d["name"] in wanted]
     log(args.state, {"event": "campaign-start", "datasets": [d["name"] for d in datasets],
-                     "chunk_rows": args.chunk_rows, "dataset_dir": args.dataset})
-    for ds in datasets:
-        process_dataset(ds, defaults, args, ckpt, env)
+                     "chunk_rows": args.chunk_rows, "dataset_dir": args.dataset,
+                     "workers": args.workers, "ort_threads": args.ort_threads})
+    if args.workers > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futs = {ex.submit(process_dataset, ds, defaults, args, ckpt, env): ds["name"]
+                    for ds in datasets}
+            for f in futs:
+                try:
+                    f.result()
+                except Exception as e:
+                    log(args.state, {"event": "dataset-fail", "dataset": futs[f],
+                                     "detail": str(e)[:300]})
+    else:
+        for ds in datasets:
+            process_dataset(ds, defaults, args, ckpt, env)
+            if getattr(args, "publish_each", False):
+                try:
+                    auto_publish(man, args, env)
+                except Exception as e:
+                    log(args.state, {"event": "publish-fail", "stage": "exception",
+                                     "after": ds["name"], "detail": str(e)[:300]})
     log(args.state, {"event": "campaign-end"})
     if getattr(args, "publish", False):
         try:
@@ -419,8 +457,14 @@ def main(argv=None):
     pr.add_argument("--min-free-gib", type=float, default=None)
     pr.add_argument("--only", default=None, help="comma-separated dataset names")
     pr.add_argument("--max-chunks", type=int, default=0, help="cap chunks per dataset (0=all)")
+    pr.add_argument("--workers", type=int, default=1,
+                    help="dataset pipelines to run in parallel (CPU data-parallelism)")
+    pr.add_argument("--ort-threads", type=int, default=2,
+                    help="intra-op thread cap per worker when --workers>1 (also caps OMP/BLAS)")
     pr.add_argument("--publish", action="store_true",
                     help="after the campaign, finalize + auto-approve + push the canonical tree to HF")
+    pr.add_argument("--publish-each", action="store_true",
+                    help="publish the (growing) canonical tree after EACH dataset completes")
     pr.add_argument("--publish-repo", default=None,
                     help="destination repo_id (default: manifest destination.repo_id)")
     pr.add_argument("--publish-private", action="store_true",
