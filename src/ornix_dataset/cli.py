@@ -426,6 +426,82 @@ def cmd_campaign_publish(args) -> int:
     return 0 if rep.get("ok") else 3
 
 
+def cmd_campaign_cleanup(args) -> int:
+    from .campaign import CampaignStore, CleanupPolicy, ReservationLedger, cleanup_batch
+
+    store = CampaignStore(args.root)
+    ledger = ReservationLedger({s: 10**24 for s in
+                                ("cache", "staging", "qc", "upload")})
+    try:
+        rep = cleanup_batch(store, args.job, args.batch, ledger=ledger,
+                            policy=CleanupPolicy())
+    except FileNotFoundError as e:
+        _print({"error": f"unknown campaign/job/batch: {e}"})
+        return 2
+    _print(rep)
+    return 0 if rep.get("ok") else 3
+
+
+def cmd_campaign_pump(args) -> int:
+    from .campaign import (
+        Budget,
+        CampaignStore,
+        ReservationLedger,
+        WatermarkGate,
+        cleanup_batch,
+        gate_batch_release,
+        prepare_release,
+        publish_release,
+        run_batch,
+        run_qc_batch,
+    )
+    from .ingestion.hf_downloader import DownloadConfig
+
+    store = CampaignStore(args.root)
+    try:
+        campaign = store.load_campaign()
+    except FileNotFoundError:
+        _print({"error": f"no campaign in {store.root}"})
+        return 2
+    budget = Budget.from_workspace(campaign.workspace, store.root,
+                                   min_free_bytes=args.min_free)
+    ledger = ReservationLedger(budget.stage_caps)
+    gate_wm = WatermarkGate(budget.high_watermark_bytes,
+                            budget.low_watermark_bytes)
+    cfg = DownloadConfig(file_workers=args.workers)
+    pipe = None
+    if args.policy:
+        pipe = _build_pipeline(args)
+
+    def _download(j, b):
+        return run_batch(store, j, b, caps=budget.stage_caps,
+                         min_free_bytes=budget.min_free_bytes,
+                         ledger=ledger, cfg=cfg)
+
+    def _qc(j, b):
+        if pipe is None:
+            return {"ok": False, "reason": "no-policy-for-qc"}
+        return run_qc_batch(store, j, b,
+                            lambda src, paths, audit: pipe.analyze_source(
+                                src, paths, audit))
+
+    def _publish(rid):
+        if not args.approval_dir or not args.repo:
+            return {"ok": False, "reason": "no-approval-dir"}
+        ap = os.path.join(args.approval_dir, f"{rid}.yaml")
+        return publish_release(store, rid, args.repo, ap, full_hash=True)
+
+    rep = pump_campaign(
+        store, ledger, gate_wm, _download, _qc,
+        lambda j, b: gate_batch_release(store, j, b),
+        prepare_one=lambda j, b: prepare_release(store, j, b),
+        publish_one=_publish if args.approval_dir else None,
+        cleanup_one=lambda j, b: cleanup_batch(store, j, b, ledger=ledger),
+        max_steps=args.max_steps)
+    _print(rep)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ornix-dataset",
                                 description="Ornix dataset quality & curation (fail-closed)")
@@ -585,6 +661,23 @@ def build_parser() -> argparse.ArgumentParser:
     cpu.add_argument("--full-hash", action="store_true")
     cpu.add_argument("--upload-retries", type=int, default=3)
     cpu.set_defaults(func=cmd_campaign_publish)
+    cc_ = cpsub.add_parser("cleanup", help="verified cleanup of one batch")
+    cc_.add_argument("--root", required=True)
+    cc_.add_argument("--job", required=True)
+    cc_.add_argument("--batch", required=True)
+    cc_.set_defaults(func=cmd_campaign_cleanup)
+    cpump = cpsub.add_parser("pump", help="automatic continuation across batches/jobs")
+    cpump.add_argument("--root", required=True)
+    cpump.add_argument("--workers", type=int, default=4)
+    cpump.add_argument("--min-free", type=int, default=None)
+    cpump.add_argument("--policy", default=None)
+    cpump.add_argument("--models-lock", default=None)
+    cpump.add_argument("--audio-profile", default=None)
+    cpump.add_argument("--approval-dir", default=None)
+    cpump.add_argument("--repo", default=None)
+    cpump.add_argument("--max-steps", type=int, default=100)
+    wd(cpump)
+    cpump.set_defaults(func=cmd_campaign_pump)
     return p
 
 

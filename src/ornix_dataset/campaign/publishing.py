@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 from ..exporters import build_release
 from ..publishing.approval import release_digest
 from ..publishing.hf import StagedPublisher, marker_path_for
+from ..util.hashing import sha256_file
 from ..util.io import read_json, write_json
 from ..util.jsonl import load_jsonl
 from ..util.timeutil import utc_now_iso
@@ -115,6 +116,16 @@ def prepare_release(store: Any, job_id: str, batch_id: str,
     return {"ok": bool(art.ready), **record}
 
 
+def release_file_inventory(release_dir: str) -> Dict[str, str]:
+    """Exact {relpath: sha256} inventory of a release dir (for intactness)."""
+    inv: Dict[str, str] = {}
+    for dp, _ds, fs in os.walk(release_dir):
+        for f in fs:
+            full = os.path.join(dp, f)
+            inv[os.path.relpath(full, release_dir)] = sha256_file(full)
+    return inv
+
+
 def publish_release(store: Any, release_id: str, repo_id: str,
                     approval_path: str, full_hash: bool = False,
                     upload_retries: int = 3) -> Dict[str, Any]:
@@ -139,6 +150,7 @@ def publish_release(store: Any, release_id: str, repo_id: str,
                    "path_prefix": record["path_prefix"],
                    "remote_commit_sha": res.remote_commit_sha,
                    "release_digest": record["digest"],
+                   "files": release_file_inventory(release_dir),
                    "n_files": res.plan.get("n_files", 0),
                    "full_hash_verified": bool(full_hash),
                    "marker": marker_path_for(release_dir),

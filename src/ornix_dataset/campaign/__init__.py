@@ -7,6 +7,13 @@ mutates a pinned revision.
 """
 
 from .models import Batch, BatchStatus, Campaign, DatasetJob, JobStatus, batch_id_for
+from .cleanup import (
+    CleanupPolicy,
+    cleanup_batch,
+    eligibility,
+    manifest_archive_path,
+    pump_campaign,
+)
 from .downloading import (
     MANIFEST_NAME,
     batch_staging_dir,
@@ -65,6 +72,7 @@ __all__ = [
     "Budget",
     "Campaign",
     "CampaignStore",
+    "CleanupPolicy",
     "DatasetJob",
     "JobStatus",
     "MANIFEST_NAME",
@@ -74,14 +82,17 @@ __all__ = [
     "batch_id_for",
     "batch_staging_dir",
     "canonical_repo_id",
+    "cleanup_batch",
     "default_resolver",
     "downloaded_files",
+    "eligibility",
     "fetch_job_inventory",
     "gate_batch_release",
     "gate_receipt_path",
     "is_full_sha",
     "list_releases",
     "load_receipt",
+    "manifest_archive_path",
     "manifest_path",
     "manifest_to_source_record",
     "normalize_repo_ref",
@@ -91,6 +102,7 @@ __all__ = [
     "plan_with_budget",
     "prepare_release",
     "publish_release",
+    "pump_campaign",
     "qc_done_files",
     "qc_paths",
     "qc_run_id",
@@ -98,6 +110,7 @@ __all__ = [
     "receipt_path_for",
     "record_path_for",
     "release_dir_for",
+    "release_file_inventory",
     "release_id_for",
     "run_batch",
     "run_qc_batch",
