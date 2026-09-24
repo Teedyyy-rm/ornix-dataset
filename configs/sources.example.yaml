@@ -21,6 +21,21 @@ sources:
     repo_id: some-org/some-vi-speech
     revision: main                        # pinned to a commit SHA at scan time
     allow_patterns: ["*.wav", "*.flac"]
+    # Bounded concurrent downloader (tier-1 file concurrency; tier-2 Xet stays
+    # env-configured BEFORE import). file_workers=1 == legacy sequential.
+    # IMPORTANT: HF_XET_* vars are read at huggingface_hub import time — set
+    # them in the process environment before start, not here.
+    download:
+      file_workers: 4                   # hard cap 32; tuned by benchmark, not guess
+      verify_workers: 4                 # hash+stage pool (hashlib releases the GIL)
+      max_inflight_bytes: 2147483648    # downloading + awaiting verify/stage
+      ready_queue_max: 64               # backpressure: QC-slow stops prefetch
+      min_free_disk_bytes: 5368709120   # 5GB reserve on cache AND staging disks
+      retry_max_attempts: 3
+      retry_deadline_seconds: 300.0
+      # allow_splits: ["train"]         # split filter BEFORE download (optional)
+      xet_high_performance: false       # opt-in only; refused on <64GB RAM
+      # xet_fixed_download_concurrency: 8  # only if benchmark proves it helps
     rights:
       rights_status: LICENSE_REVIEW
       redistribution_permitted: false

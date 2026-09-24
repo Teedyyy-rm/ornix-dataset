@@ -16,8 +16,8 @@ from ..contracts.source import SourceRecord
 from ..dsp.admission import AdmissionConfig, _rate_class, classify_lossy
 from ..dsp.decode import DecodeError, ffprobe_info
 from ..util.hashing import sha256_file, short_id
-from ..util.timeutil import utc_now_iso
 from .base import SourceAdapter
+from .hf_downloader import DownloadConfig, matches_patterns
 from .local import AUDIO_EXTS
 from .permissions import PermissionGate
 
@@ -27,13 +27,25 @@ class HfSourceAdapter(SourceAdapter):
 
     def __init__(self, repo_id: str, gate: PermissionGate, revision: str = "main",
                  token: Optional[str] = None, metadata: Optional[Dict[str, Dict[str, Any]]] = None,
-                 allow_patterns: Optional[List[str]] = None):
+                 allow_patterns: Optional[List[str]] = None,
+                 ignore_patterns: Optional[List[str]] = None,
+                 download: Optional[Dict[str, Any]] = None):
         self.repo_id = repo_id
         self.gate = gate
         self.revision = revision
+        # explicit token wins; otherwise resolved from HF_TOKEN at download time
+        # (never logged). None relies on the SDK implicit-token behavior.
         self.token = token
         self.metadata = metadata or {}
         self.allow_patterns = allow_patterns
+        self.ignore_patterns = ignore_patterns
+        self.download_cfg = DownloadConfig.from_dict(download)
+        if allow_patterns and not self.download_cfg.allow_patterns:
+            self.download_cfg.allow_patterns = list(allow_patterns)
+        if ignore_patterns and not self.download_cfg.ignore_patterns:
+            self.download_cfg.ignore_patterns = list(ignore_patterns)
+        self.allow_patterns = self.download_cfg.allow_patterns
+        self.ignore_patterns = self.download_cfg.ignore_patterns
         self._resolved_sha: Optional[str] = None
 
     def _api(self):
@@ -59,6 +71,11 @@ class HfSourceAdapter(SourceAdapter):
         for sib in getattr(info, "siblings", []) or []:
             rfn = sib.rfilename
             if not any(rfn.lower().endswith(e) for e in AUDIO_EXTS):
+                continue
+            # pre-download filter: patterns apply here so non-matching files
+            # never reach the manifest/staging (invariant 5), and the batch
+            # inventory joins against exactly these records.
+            if not matches_patterns(rfn, self.allow_patterns, self.ignore_patterns):
                 continue
             yield self._record(rfn, sib, sha)
 
@@ -116,9 +133,11 @@ class HfSourceAdapter(SourceAdapter):
         except Exception as e:  # fail-closed
             raise RuntimeError(f"huggingface_hub unavailable: {e}")
         os.makedirs(dest_dir, exist_ok=True)
+        # explicit token (constructor or HF_TOKEN env); never logged.
+        token = self.token or os.environ.get("HF_TOKEN")
         local = hf_hub_download(
             repo_id=self.repo_id, filename=record.original_file_id,
-            revision=record.source_revision, repo_type="dataset", token=self.token)
+            revision=record.source_revision, repo_type="dataset", token=token)
         content_sha = sha256_file(local)
         # only enforce when we actually resolved a remote blob sha (not a derived id)
         if "SOURCE_SHA_UNVERIFIED_FROM_REMOTE" not in record.reason_codes:

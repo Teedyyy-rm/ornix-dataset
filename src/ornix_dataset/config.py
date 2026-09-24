@@ -57,7 +57,10 @@ def build_gate_and_adapters(sources_config: str) -> Tuple[PermissionGate, List[A
         elif spec["type"] == "hf":
             adapters.append(HfSourceAdapter(
                 repo_id=spec["repo_id"], gate=gate, revision=spec.get("revision", "main"),
-                metadata=meta, allow_patterns=spec.get("allow_patterns")))
+                token=spec.get("token") or os.environ.get("HF_TOKEN"),
+                metadata=meta, allow_patterns=spec.get("allow_patterns"),
+                ignore_patterns=spec.get("ignore_patterns"),
+                download=spec.get("download")))
         else:
             raise ValueError(f"unknown source type {spec['type']!r}")
     return gate, adapters, specs

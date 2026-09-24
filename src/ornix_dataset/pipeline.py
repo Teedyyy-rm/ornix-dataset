@@ -330,6 +330,13 @@ class OrnixPipeline:
         )
 
     def ingest_and_stage(self, adapter, paths: RunPaths, audit: AuditLog) -> List[SourceRecord]:
+        from .ingestion.hf import HfSourceAdapter
+
+        # HF batch path: bounded concurrent downloader. file_workers=1 keeps
+        # the exact legacy sequential behavior (back-compatible, T16).
+        if isinstance(adapter, HfSourceAdapter) and \
+                adapter.download_cfg.effective().file_workers > 1:
+            return self.ingest_and_stage_hf(adapter, paths, audit)
         import shutil
 
         from .util.jsonl import read_jsonl
@@ -369,6 +376,119 @@ class OrnixPipeline:
             audit.emit("ingest", rec.source_id, status=rec.ingest_status.value,
                        rights=rec.rights_status.value)
             records.append(rec)
+        return records
+
+    def ingest_and_stage_hf(self, adapter, paths: RunPaths,
+                            audit: AuditLog) -> List[SourceRecord]:
+        """Bounded-concurrent HF ingest (file_workers > 1).
+
+        Manifest order == scan/inventory order regardless of completion order
+        (single ordered writer), so downstream sees the same sequence as the
+        legacy sequential path. Records for quarantined sources are kept in
+        the manifest (as legacy) but never downloaded (PermissionGate first).
+        """
+        import os
+
+        from .ingestion.hf import HfSourceAdapter
+        from .ingestion.hf_downloader import (
+            HfBatchDownloader,
+            apply_env,
+            build_inventory,
+            classify_profile,
+            effective_env_snapshot,
+        )
+        from .ops.checkpoint import Checkpoint
+        from .util.jsonl import read_jsonl
+
+        staging = os.path.join(paths.root, "staging")
+        os.makedirs(staging, exist_ok=True)
+        records: List[SourceRecord] = []
+        seen_sha: Dict[str, str] = {}
+        for prev in read_jsonl(paths.source_manifest):
+            seen_sha.setdefault(prev.get("source_sha256"), prev.get("source_id"))
+
+        scanned = list(adapter.scan())  # resolves + pins the commit SHA once
+        fresh: List[SourceRecord] = []
+        for r in scanned:
+            if r.source_sha256 in seen_sha:
+                audit.emit("ingest_skip_duplicate", r.source_id,
+                           duplicate_of=seen_sha[r.source_sha256])
+                continue
+            seen_sha[r.source_sha256] = r.source_id
+            fresh.append(r)
+        eligible = [r for r in fresh if r.ingest_status == IngestStatus.INGESTED]
+        splits = adapter.download_cfg.allow_splits
+        by_path: Dict[str, SourceRecord] = {}
+        for r in eligible:
+            if splits and r.source_split and r.source_split not in splits:
+                audit.emit("ingest_skip_split", r.source_id, split=r.source_split)
+                continue
+            by_path[r.original_file_id] = r
+        # quarantined/error records stay in the manifest (legacy parity) but
+        # are never downloaded.
+        by_ids = {id(r) for r in by_path.values()}
+        for r in fresh:
+            if id(r) not in by_ids:
+                append_jsonl(paths.source_manifest, r.to_dict())
+                audit.emit("ingest", r.source_id, status=r.ingest_status.value,
+                           rights=r.rights_status.value)
+                records.append(r)
+        if not by_path:
+            return records
+
+        shas = {r.source_revision for r in by_path.values()}
+        if len(shas) != 1:
+            raise RuntimeError(f"mixed pinned revisions in one run: {shas}")
+        pinned = next(iter(shas))
+        cfg = adapter.download_cfg.effective()
+        for warning in apply_env(cfg):
+            audit.emit("download_env_warning", adapter.repo_id, warning=warning)
+        inventory = build_inventory(
+            adapter._api(), adapter.repo_id, pinned,
+            allow=cfg.allow_patterns, ignore=cfg.ignore_patterns,
+            allow_empty=cfg.allow_empty_inventory)
+        inventory = [it for it in inventory if it.path_in_repo in by_path]
+        if cfg.allow_patterns or cfg.ignore_patterns:
+            if not inventory:
+                raise RuntimeError(
+                    "patterns matched 0 downloadable files; fail-closed")
+        journal = Checkpoint(os.path.join(paths.root, "download_journal.jsonl"),
+                             f"dl-{pinned[:12]}")
+        # crash recovery without re-download: staged files from a previous
+        # interrupted run are re-verified (size+sha), never trusted by existence.
+        skip: Dict[str, str] = {}
+        for it in inventory:
+            rec = by_path[it.path_in_repo]
+            ext = os.path.splitext(rec.original_file_id)[1] or ".bin"
+            cand = os.path.join(staging, f"{rec.source_id}{ext}")
+            if os.path.exists(cand):
+                skip[f"{adapter.repo_id}@{pinned}/{it.path_in_repo}"] = cand
+        dl = HfBatchDownloader(adapter.repo_id, pinned, staging, cfg=cfg,
+                               journal=journal)
+        audit.emit("download_start", adapter.repo_id, revision=pinned,
+                   n_files=len(inventory),
+                   profile=classify_profile(inventory, cfg),
+                   env=effective_env_snapshot())
+        results = dl.run(inventory,
+                         staged_name=lambda it: f"{by_path[it.path_in_repo].source_id}"
+                         f"{os.path.splitext(by_path[it.path_in_repo].original_file_id)[1] or '.bin'}",
+                         skip_staged=skip)
+        for res in results:  # inventory order (single ordered writer)
+            rec = by_path[res.path_in_repo]
+            rec.staged_path = res.staged_path
+            HfSourceAdapter._patch_probe_provenance(rec, res.staged_path)
+            append_jsonl(paths.source_manifest, rec.to_dict())
+            audit.emit("ingest", rec.source_id, status=rec.ingest_status.value,
+                       rights=rec.rights_status.value,
+                       staged=os.path.basename(res.staged_path),
+                       sha256=res.sha256, verify=res.verify_method,
+                       from_cache=res.from_cache, reused=res.reused_staged)
+            records.append(rec)
+            seen_sha[rec.source_sha256] = rec.source_id
+        write_json(os.path.join(paths.root, "download_metrics.json"),
+                   {**dl.metrics.to_dict(),
+                    "repo_id": adapter.repo_id, "revision": pinned})
+        audit.emit("download_done", adapter.repo_id, **dl.metrics.to_dict())
         return records
 
     def run(self, adapter, paths: RunPaths, audit: AuditLog) -> AnalyzeResult:

@@ -1,6 +1,8 @@
 # Working directories — never committed, never uploaded (spec §0.2.6, §7)
 work/
 !work/.gitkeep
+# Local HF/Xet caches (may live under ./cache via HF_HOME) — never committed
+cache/
 
 # Secrets & tokens
 *.token

@@ -22,7 +22,7 @@ dependencies = [
 [project.optional-dependencies]
 dsp = ["scipy>=1.10", "soundfile>=0.12"]
 export = ["pyarrow>=12"]
-hf = ["huggingface_hub>=0.30"]
+hf = ["huggingface_hub>=1.2"]  # >=1.2: SDK-owned 429 smart-retry (RateLimit header)
 # ML detector back-ends are pluggable; install only what you have rights to use.
 vad = ["onnxruntime>=1.16"]          # Silero VAD (MIT) + DNSMOS ONNX
 quality = ["onnxruntime>=1.16"]      # DNSMOS P.835 (code MIT; verify weights terms)
@@ -31,7 +31,7 @@ speaker = ["pyannote.audio>=3.1", "torch>=2.1"]  # GATED: needs HF token + terms
 torch = ["torch>=2.1"]
 full = [
     "scipy>=1.10", "soundfile>=0.12", "pyarrow>=12",
-    "huggingface_hub>=0.30", "onnxruntime>=1.16",
+    "huggingface_hub>=1.2", "onnxruntime>=1.16",
 ]
 dev = ["pytest>=8", "pytest-cov>=4"]
 
