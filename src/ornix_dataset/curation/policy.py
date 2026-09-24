@@ -27,6 +27,10 @@ class PolicyConfig:
     required_checks: List[str]
     min_speech_ratio: float = 0.5
     max_clip_ratio: float = 0.01
+    # Final-clip duration window (seconds). Clips outside are rejected. Long SOURCES
+    # are already dropped at the technical gate; this also guards analysis segments.
+    min_duration_s: float = 3.0
+    max_duration_s: float = 12.0
     hiss_overlap_max_severity: str = "N1"  # allow up to this severity overlapping speech
     music_overlap_forbidden: bool = True
     single_speaker_required: bool = False
@@ -64,6 +68,7 @@ class PolicyEngine:
         reasons: List[str] = []
 
         checks["has_speech"] = self._has_speech(ev, reasons)
+        checks["duration_ok"] = self._duration(ev, reasons)
         checks["no_clipping"] = self._no_clipping(ev, reasons)
         checks["no_confirmed_music_overlap"] = self._music(ev, avail, reasons)
         checks["no_severe_noise_overlap"] = self._noise_overlap(ev, reasons)
@@ -83,6 +88,20 @@ class PolicyEngine:
             return UNKNOWN
         if ev.speech_ratio < self.config.min_speech_ratio:
             reasons.append(f"NO_SPEECH:ratio={ev.speech_ratio:.2f}")
+            return FAIL
+        return PASS
+
+    def _duration(self, ev, reasons) -> str:
+        sr = ev.analysis_sample_rate
+        if not sr or ev.interval_end_sample <= ev.interval_start_sample:
+            reasons.append("DURATION_UNKNOWN")
+            return UNKNOWN
+        dur = (ev.interval_end_sample - ev.interval_start_sample) / sr
+        if dur < self.config.min_duration_s:
+            reasons.append(f"DURATION_TOO_SHORT:{dur:.2f}s<{self.config.min_duration_s:.1f}s")
+            return FAIL
+        if dur > self.config.max_duration_s:
+            reasons.append(f"DURATION_TOO_LONG:{dur:.2f}s>{self.config.max_duration_s:.1f}s")
             return FAIL
         return PASS
 

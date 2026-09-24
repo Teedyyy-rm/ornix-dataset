@@ -6,6 +6,7 @@ policy_version: ornix-qc-v1
 release_target: public
 required_checks:
   - has_speech
+  - duration_ok
   - no_clipping
   - no_confirmed_music_overlap
   - no_severe_noise_overlap
@@ -16,6 +17,8 @@ required_checks:
 
 min_speech_ratio: 0.6
 max_clip_ratio: 0.01
+min_duration_s: 3.0
+max_duration_s: 12.0
 hiss_overlap_max_severity: N1
 music_overlap_forbidden: true
 single_speaker_required: true

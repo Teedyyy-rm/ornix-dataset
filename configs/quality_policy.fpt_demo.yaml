@@ -7,6 +7,7 @@ policy_version: ornix-qc-fpt-demo-v1
 release_target: train_only
 required_checks:
   - has_speech
+  - duration_ok
   - no_clipping
   - no_severe_noise_overlap
   - quality_ok
@@ -14,6 +15,8 @@ required_checks:
 
 min_speech_ratio: 0.3
 max_clip_ratio: 0.02
+min_duration_s: 3.0
+max_duration_s: 12.0
 hiss_overlap_max_severity: N2
 music_overlap_forbidden: false
 single_speaker_required: false

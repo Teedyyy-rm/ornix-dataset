@@ -53,8 +53,15 @@ def test_t009_boundary_durations(tmp_path):
     assert run_technical_validation(short).decision == "REJECT_TECH"
     ok = _wav(tmp_path, "ok.wav", synth.speechlike(24000, 11.9), 24000)
     assert run_technical_validation(ok).valid
+    # default: sources longer than max_duration_s are DROPPED outright (no segmenting)
     long = _wav(tmp_path, "long.wav", synth.speechlike(24000, 20.0), 24000)
-    assert run_technical_validation(long).decision == "SEGMENT_CANDIDATE"
+    r_long = run_technical_validation(long)
+    assert r_long.decision == "REJECT_TECH" and not r_long.valid
+    assert any("TOO_LONG" in rc for rc in r_long.reason_codes)
+    # opt-in: segment_over_max restores salvage-by-segmentation
+    from ornix_dataset.dsp.technical import TechnicalThresholds
+    t = TechnicalThresholds(segment_over_max=True)
+    assert run_technical_validation(long, t).decision == "SEGMENT_CANDIDATE"
 
 
 def test_declared_duration_mismatch(tmp_path):

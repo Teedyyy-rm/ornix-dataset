@@ -8,7 +8,8 @@ audio_output:
 technical_thresholds:
   min_duration_s: 0.4
   max_duration_s: 12.0
-  max_duration_pre_segment_s: 600.0   # longer sources -> segmentation, not reject
+  segment_over_max: false             # sources longer than max_duration_s are DROPPED
+  max_duration_pre_segment_s: 600.0   # only used if segment_over_max is true
   max_dc_offset: 0.02
   max_clipping_ratio: 0.01
   min_rms: 0.0001

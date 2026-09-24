@@ -21,7 +21,9 @@ from .features import SignalStats, signal_stats
 class TechnicalThresholds:
     min_duration_s: float = 0.2
     max_duration_s: float = 12.0
-    max_duration_pre_segment_s: float = 600.0  # longer -> segmentation, not reject
+    max_duration_pre_segment_s: float = 600.0  # only used when segment_over_max is on
+    segment_over_max: bool = False  # default: drop sources longer than max_duration_s
+    #   (no segmentation). Set True to restore salvage-by-segmentation of long files.
     max_dc_offset: float = 0.02
     max_clipping_ratio: float = 0.01
     min_rms: float = 1e-4  # below -> effectively silent / no speech level
@@ -133,11 +135,11 @@ def _evaluate(
         reasons.append(f"TOO_SHORT:{dur:.3f}s<{t.min_duration_s}s")
         decision = "REJECT_TECH"
     elif dur > t.max_duration_s:
-        if dur <= t.max_duration_pre_segment_s:
+        if t.segment_over_max and dur <= t.max_duration_pre_segment_s:
             reasons.append(f"OVER_MAX_DURATION_SEGMENT_CANDIDATE:{dur:.3f}s")
             decision = "SEGMENT_CANDIDATE"
         else:
-            reasons.append(f"TOO_LONG:{dur:.3f}s>{t.max_duration_pre_segment_s}s")
+            reasons.append(f"TOO_LONG:{dur:.3f}s>{t.max_duration_s}s")
             decision = "REJECT_TECH"
 
     hard = {"NAN_SAMPLES", "INF_SAMPLES", "EMPTY_AUDIO", "SILENT_OR_NO_SPEECH_LEVEL"}

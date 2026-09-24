@@ -42,6 +42,29 @@ def test_t001_clean_accept():
     assert d.decision == DecisionState.ACCEPT
 
 
+def test_duration_gate_rejects_out_of_window():
+    req = ["has_speech", "duration_ok", "rights_ok"]
+
+    def eng():
+        return PolicyEngine(PolicyConfig(policy_version="v1", required_checks=req,
+                                         min_duration_s=3.0, max_duration_s=12.0))
+
+    # 5.0s (48000 @ 16k) -> in window -> ACCEPT
+    ok = eng().decide(_ev(interval_start_sample=0, interval_end_sample=48000,
+                          analysis_sample_rate=16000), _src(), ALL_AVAIL)
+    assert ok.decision == DecisionState.ACCEPT
+    # 2.5s -> below floor -> REJECT
+    short = eng().decide(_ev(interval_start_sample=0, interval_end_sample=40000,
+                             analysis_sample_rate=16000), _src(), ALL_AVAIL)
+    assert short.decision == DecisionState.REJECT
+    assert any("DURATION_TOO_SHORT" in r for r in short.reason_codes)
+    # 13.0s -> above ceiling -> REJECT
+    long = eng().decide(_ev(interval_start_sample=0, interval_end_sample=208000,
+                            analysis_sample_rate=16000), _src(), ALL_AVAIL)
+    assert long.decision == DecisionState.REJECT
+    assert any("DURATION_TOO_LONG" in r for r in long.reason_codes)
+
+
 def test_t002_music_gate_unavailable_is_review():
     d = _engine().decide(_ev(), _src(), {"music": False, "quality": True, "speaker": True})
     assert d.decision == DecisionState.REVIEW
