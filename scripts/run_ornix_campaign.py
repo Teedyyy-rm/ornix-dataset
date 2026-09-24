@@ -272,6 +272,11 @@ def cmd_run(args):
     os.makedirs(args.state, exist_ok=True)
     os.makedirs(args.workdir, exist_ok=True)
     env = dict(os.environ)
+    try:
+        import hf_transfer  # noqa: F401
+        env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"  # faster bulk shard downloads
+    except Exception:
+        pass
     ckpt = load_ckpt(args.state)
     datasets = man["datasets"]
     if args.only:

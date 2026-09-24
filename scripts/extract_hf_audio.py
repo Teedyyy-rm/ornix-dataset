@@ -21,6 +21,7 @@ import argparse
 import csv
 import json
 import os
+import shutil
 import sys
 
 # Loose-file ingestion keys off the extension, but HF parquet audio commonly stores
@@ -91,6 +92,13 @@ def _uniq_name(rel_path, blob, index):
     return (root or f"clip_{index:06d}") + _sniff_ext(blob)
 
 
+def _dl_shard(repo, rfilename, tmp_dir):
+    """Bulk-download one shard to local disk (fast, resumable) for local reads."""
+    from huggingface_hub import hf_hub_download
+    return hf_hub_download(repo, rfilename, repo_type="dataset",
+                           local_dir=tmp_dir)
+
+
 def extract_parquet(args, api, fs):
     import pyarrow.parquet as pq
     info = api.dataset_info(args.repo, revision="main")
@@ -99,46 +107,54 @@ def extract_parquet(args, api, fs):
                     if s.rfilename.endswith(".parquet")
                     and (prefix == "" or s.rfilename.startswith(prefix)))
     if not shards:
-        # fall back to any parquet anywhere in the repo
         shards = sorted(s.rfilename for s in (info.siblings or [])
                         if s.rfilename.endswith(".parquet"))
     if not shards:
         raise SystemExit(f"[FAIL] no parquet shards in {args.repo}")
 
     os.makedirs(args.out, exist_ok=True)
+    tmp = os.path.join(args.out, "_shards")
+    os.makedirs(tmp, exist_ok=True)
     meta = []
     written = 0
-    si, rgi = args.start_shard, args.start_rg
-    next_shard, next_rg, exhausted = si, rgi, True
+    si = args.start_shard
+    # Shard-granular paging: each shard is bulk-downloaded, fully processed, then
+    # deleted (disk-bounded to one shard); --limit is a soft floor honored at the
+    # next shard boundary, so a shard is never re-downloaded across resume calls.
     while si < len(shards):
-        pf = pq.ParquetFile(fs.open(f"datasets/{args.repo}/{shards[si]}", "rb"))
-        ng = pf.num_row_groups
-        rg = rgi
-        while rg < ng:
-            if written >= args.limit:
-                next_shard, next_rg, exhausted = si, rg, False
-                _write_meta(args.out, meta)
-                return {"written": written, "next_shard": next_shard,
-                        "next_rg": next_rg, "exhausted": exhausted, "sha": info.sha[:12]}
-            cols = [args.audio_col, args.text_col]
-            if args.speaker_col:
-                cols.append(args.speaker_col)
-            tbl = pf.read_row_group(rg, columns=cols)
-            audio = tbl.column(args.audio_col).to_pylist()
-            text = tbl.column(args.text_col).to_pylist()
-            spk = tbl.column(args.speaker_col).to_pylist() if args.speaker_col else [None] * len(audio)
-            for a, t, s in zip(audio, text, spk):
-                b = a.get("bytes") if a else None
-                if not b:
-                    continue
-                name = _named(a.get("path"), b, written)
-                with open(os.path.join(args.out, name), "wb") as fh:
-                    fh.write(b)
-                meta.append(_meta_row(name, t, args.language, _speaker_for_row(args, s)))
-                written += 1
-            rg += 1
+        local = _dl_shard(args.repo, shards[si], tmp)
+        try:
+            pf = pq.ParquetFile(local)
+            for rg in range(pf.num_row_groups):
+                cols = [args.audio_col, args.text_col]
+                if args.speaker_col:
+                    cols.append(args.speaker_col)
+                tbl = pf.read_row_group(rg, columns=cols)
+                audio = tbl.column(args.audio_col).to_pylist()
+                text = tbl.column(args.text_col).to_pylist()
+                spk = tbl.column(args.speaker_col).to_pylist() if args.speaker_col \
+                    else [None] * len(audio)
+                for a, t, s in zip(audio, text, spk):
+                    b = a.get("bytes") if a else None
+                    if not b:
+                        continue
+                    name = _named(a.get("path"), b, written)
+                    with open(os.path.join(args.out, name), "wb") as fh:
+                        fh.write(b)
+                    meta.append(_meta_row(name, t, args.language, _speaker_for_row(args, s)))
+                    written += 1
+        finally:
+            try:
+                os.remove(local)
+            except OSError:
+                pass
         si += 1
-        rgi = 0
+        if written >= args.limit:
+            shutil.rmtree(tmp, ignore_errors=True)
+            _write_meta(args.out, meta)
+            return {"written": written, "next_shard": si, "next_rg": 0,
+                    "exhausted": si >= len(shards), "sha": info.sha[:12]}
+    shutil.rmtree(tmp, ignore_errors=True)
     _write_meta(args.out, meta)
     return {"written": written, "next_shard": si, "next_rg": 0,
             "exhausted": True, "sha": info.sha[:12]}
@@ -152,46 +168,49 @@ def extract_arrow(args, api, fs):
     if not shards:
         raise SystemExit(f"[FAIL] no .arrow shards in {args.repo}")
     os.makedirs(args.out, exist_ok=True)
+    tmp = os.path.join(args.out, "_shards")
+    os.makedirs(tmp, exist_ok=True)
     meta = []
     written = 0
-    si, bi = args.start_shard, args.start_rg
+    si = args.start_shard
     while si < len(shards):
-        with fs.open(f"datasets/{args.repo}/{shards[si]}", "rb") as fh:
+        local = _dl_shard(args.repo, shards[si], tmp)
+        try:
+            with open(local, "rb") as fh:
+                try:
+                    reader = pa.ipc.open_stream(fh)
+                    batches = list(reader)
+                except pa.lib.ArrowInvalid:
+                    fh.seek(0)
+                    reader = pa.ipc.open_file(fh)
+                    batches = [reader.get_batch(i) for i in range(reader.num_record_batches)]
+                for batch in batches:
+                    d = batch.to_pydict()
+                    audio = d.get(args.audio_col, [])
+                    text = d.get(args.text_col, [None] * len(audio))
+                    spk = d.get(args.speaker_col, [None] * len(audio)) if args.speaker_col \
+                        else [None] * len(audio)
+                    for a, t, s in zip(audio, text, spk):
+                        blob = a.get("bytes") if a else None
+                        if not blob:
+                            continue
+                        name = _named(a.get("path"), blob, written)
+                        with open(os.path.join(args.out, name), "wb") as w:
+                            w.write(blob)
+                        meta.append(_meta_row(name, t, args.language, _speaker_for_row(args, s)))
+                        written += 1
+        finally:
             try:
-                reader = pa.ipc.open_stream(fh)
-            except pa.lib.ArrowInvalid:
-                fh.seek(0)
-                reader = pa.ipc.open_file(fh)
-            batches = (reader.read_all().to_batches() if hasattr(reader, "read_all")
-                       else [reader.get_batch(i) for i in range(reader.num_record_batches)]) \
-                if hasattr(reader, "num_record_batches") else None
-            b_idx = 0
-            it = iter(batches) if batches is not None else iter(reader)
-            for batch in it:
-                if b_idx < bi:
-                    b_idx += 1
-                    continue
-                if written >= args.limit:
-                    _write_meta(args.out, meta)
-                    return {"written": written, "next_shard": si, "next_rg": b_idx,
-                            "exhausted": False, "sha": info.sha[:12]}
-                d = batch.to_pydict()
-                audio = d.get(args.audio_col, [])
-                text = d.get(args.text_col, [None] * len(audio))
-                spk = d.get(args.speaker_col, [None] * len(audio)) if args.speaker_col \
-                    else [None] * len(audio)
-                for a, t, s in zip(audio, text, spk):
-                    blob = a.get("bytes") if a else None
-                    if not blob:
-                        continue
-                    name = _named(a.get("path"), blob, written)
-                    with open(os.path.join(args.out, name), "wb") as w:
-                        w.write(blob)
-                    meta.append(_meta_row(name, t, args.language, _speaker_for_row(args, s)))
-                    written += 1
-                b_idx += 1
+                os.remove(local)
+            except OSError:
+                pass
         si += 1
-        bi = 0
+        if written >= args.limit:
+            shutil.rmtree(tmp, ignore_errors=True)
+            _write_meta(args.out, meta)
+            return {"written": written, "next_shard": si, "next_rg": 0,
+                    "exhausted": si >= len(shards), "sha": info.sha[:12]}
+    shutil.rmtree(tmp, ignore_errors=True)
     _write_meta(args.out, meta)
     return {"written": written, "next_shard": si, "next_rg": 0,
             "exhausted": True, "sha": info.sha[:12]}

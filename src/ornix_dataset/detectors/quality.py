@@ -53,8 +53,9 @@ class DnsmosAdapter(QualityAdapter):
                 self._reason = "weights sha256 mismatch"
                 return
             import onnxruntime as ort
+            from ._providers import onnx_providers
             self._session = ort.InferenceSession(self.model_path,
-                                                  providers=["CPUExecutionProvider"])
+                                                  providers=onnx_providers())
             self._input_name = self._session.get_inputs()[0].name
         except Exception as e:  # pragma: no cover - depends on runtime/weights
             self._reason = f"onnxruntime/weights unavailable: {e}"

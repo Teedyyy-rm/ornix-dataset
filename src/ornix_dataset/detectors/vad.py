@@ -111,8 +111,9 @@ class SileroVadAdapter(VadAdapter):
                 return
             import onnxruntime as ort
 
+            from ._providers import onnx_providers
             self._session = ort.InferenceSession(self.model_path,
-                                                  providers=["CPUExecutionProvider"])
+                                                  providers=onnx_providers())
         except Exception as e:  # pragma: no cover - depends on runtime
             self._reason = f"failed to init session: {e}"
 
