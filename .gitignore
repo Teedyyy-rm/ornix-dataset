@@ -8,6 +8,7 @@ cache/
 *.token
 .env
 .env.*
+!.env.example
 *_token.txt
 hf_token*
 

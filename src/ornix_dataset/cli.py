@@ -550,6 +550,13 @@ def cmd_campaign_pump(args) -> int:
     return 0
 
 
+def cmd_env_status(args) -> int:
+    from .ops.env import env_status, find_env_file
+
+    _print({"env_file": find_env_file(), **env_status()})
+    return 0
+
+
 def cmd_canonical_export(args) -> int:
     from .canonical import export_run
 
@@ -849,10 +856,20 @@ def build_parser() -> argparse.ArgumentParser:
     cl = cnsub.add_parser("load", help="load the dataset via the canonical loader")
     cl.add_argument("--dataset", required=True)
     cl.set_defaults(func=cmd_canonical_load)
+
+    env = sub.add_parser("env", help="environment / .env helpers")
+    envsub = env.add_subparsers(dest="sub", required=True)
+    es = envsub.add_parser("status", help="show whether HF_TOKEN is set (no value)")
+    es.set_defaults(func=cmd_env_status)
     return p
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    # Load .env once (existing env vars win) so operators can keep HF_TOKEN out
+    # of their shell history. The value is never logged.
+    from .ops.env import load_dotenv
+
+    load_dotenv()
     parser = build_parser()
     args = parser.parse_args(argv)
     return args.func(args)

@@ -24,6 +24,22 @@ uv pip install -e ".[full]"         # everything the adapters can use
 weights (Silero VAD, PANNs, DNSMOS, pyannote) are **optional**; when absent the
 adapters report `UNAVAILABLE` and the affected gates stay `UNKNOWN` (fail-closed).
 
+## Environment & Hugging Face token
+
+Tokens are read only from the environment (never from logs) and can be kept in a
+local `.env`, which the CLI loads at startup. Real environment variables always
+take precedence, and `.env` is git-ignored while `.env.example` is the template:
+
+```bash
+cp .env.example .env      # then set HF_TOKEN=hf_... (fine-grained, write scope
+                          # limited to the destination dataset repo)
+ornix-dataset env status  # reports whether HF_TOKEN is set (never the value)
+```
+
+Use a token with write access to **only** `Teedyyy-rm/Ornix-Datasets`; without a
+token, download/inventory/publish fail closed. `HF_HOME` (optional) relocates the
+HF/Xet cache; `ORNIX_ENV_FILE` points at a `.env` outside the repo.
+
 ## Pipeline stages (phase → module)
 
 | Phase | Concern | Module |
