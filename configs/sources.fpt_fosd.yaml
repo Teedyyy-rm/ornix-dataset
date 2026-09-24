@@ -12,4 +12,5 @@ sources:
       rights_status: REDISTRIBUTION_APPROVED
       redistribution_permitted: true
       commercial_training_permitted: "true"
+      source_license: CC-BY-4.0
       note: "FPT FOSD, CC-BY-4.0; attribution required"

@@ -77,7 +77,7 @@ class LocalSourceAdapter(SourceAdapter):
             source_sample_rate=declared_sr, source_channels=info.get("channels"),
             source_duration_s=info.get("duration_s"),
             source_rate_class=rate_class,
-            source_license=meta.get("source_license", "UNKNOWN"),
+            source_license=decision.source_license,
             license_evidence_uri=meta.get("license_evidence_uri"),
             rights_owner=meta.get("rights_owner"), consent_reference=meta.get("consent_reference"),
             rights_status=decision.rights_status,

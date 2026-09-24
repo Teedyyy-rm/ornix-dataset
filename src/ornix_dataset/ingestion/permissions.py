@@ -19,6 +19,7 @@ class RightsDecision:
     redistribution_permitted: bool
     commercial_training_permitted: str  # "true" | "false" | "UNKNOWN"
     reason: str
+    source_license: str = "UNKNOWN"
 
 
 class PermissionGate:
@@ -35,18 +36,25 @@ class PermissionGate:
             decl = self._match_prefix(source_uri)
         if decl is None:
             return RightsDecision(RightsStatus.LICENSE_REVIEW, False, "UNKNOWN",
-                                  "no explicit rights declaration for source")
+                                  "no explicit rights declaration for source",
+                                  source_license=declared_license or "UNKNOWN")
+        # Per-file license (most specific) wins; otherwise the per-source rights
+        # declaration carries it. Losing it would strip a redistribution-critical
+        # attribution/license obligation from the published dataset.
+        license_ = declared_license or decl.get("source_license") or "UNKNOWN"
         status = RightsStatus(decl.get("rights_status", "LICENSE_REVIEW"))
         redistribute = bool(decl.get("redistribution_permitted", False))
         commercial = str(decl.get("commercial_training_permitted", "UNKNOWN"))
         # Fail-closed cross-checks: redistribution only if explicitly approved.
         if status != RightsStatus.REDISTRIBUTION_APPROVED and redistribute:
             return RightsDecision(RightsStatus.LICENSE_REVIEW, False, commercial,
-                                  "redistribution flag set without APPROVED status")
+                                  "redistribution flag set without APPROVED status",
+                                  source_license=license_)
         if status == RightsStatus.FORBIDDEN:
             redistribute = False
         return RightsDecision(status, redistribute, commercial,
-                              decl.get("note", "declared in config"))
+                              decl.get("note", "declared in config"),
+                              source_license=license_)
 
     def _match_prefix(self, source_uri: str) -> Optional[Dict[str, Any]]:
         best = None

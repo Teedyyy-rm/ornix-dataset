@@ -1,0 +1,20 @@
+# Real-run test source: ThanhPahm-TTS (toandev/ThanhPahm-TTS).
+# License on the Hub is CC-BY-NC-SA-4.0 — redistribution is allowed WITH
+# attribution, NON-COMMERCIAL, and ShareAlike. We therefore declare
+# redistribution permitted but commercial training NOT permitted; the tool never
+# infers rights. Audio is extracted from the parquet-embedded shards via
+# scripts/extract_hf_audio.py (already 24 kHz mono PCM16 WAV).
+sources:
+  - name: thanhpahm_tts_sample
+    type: local
+    root: ./work/thanhpahm_sample
+    source_revision: "toandev/ThanhPahm-TTS@0cc50dd71743"
+    probe: true
+    metadata_file: ./work/thanhpahm_sample/metadata.jsonl
+    rights:
+      rights_status: REDISTRIBUTION_APPROVED
+      redistribution_permitted: true
+      commercial_training_permitted: "false"
+      attribution_required: true
+      source_license: CC-BY-NC-SA-4.0
+      note: "ThanhPahm-TTS, CC-BY-NC-SA-4.0; attribution + non-commercial + share-alike"

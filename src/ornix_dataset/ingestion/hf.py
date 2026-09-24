@@ -100,7 +100,7 @@ class HfSourceAdapter(SourceAdapter):
         return SourceRecord(
             source_id=source_id, source_uri=uri, source_revision=sha,
             original_file_id=rfilename, source_sha256=source_sha, source_bytes=int(nbytes),
-            source_license=meta.get("source_license", "UNKNOWN"),
+            source_license=decision.source_license,
             license_evidence_uri=meta.get("license_evidence_uri"),
             rights_status=decision.rights_status,
             redistribution_permitted=decision.redistribution_permitted,

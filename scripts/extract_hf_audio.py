@@ -19,6 +19,41 @@ import json
 import os
 import sys
 
+# Loose-file ingestion (LocalSourceAdapter) keys off the file extension, but HF
+# parquet audio commonly stores ``path: null`` — so the original container has to
+# be recovered from the leading magic bytes, else the extracted clips land with
+# no extension and are silently skipped at ingest.
+_MAGIC_EXTS = (
+    (b"RIFF", ".wav"),      # WAV (RIFF/WAVE)
+    (b"fLaC", ".flac"),     # FLAC
+    (b"OggS", ".ogg"),      # Ogg (Vorbis/Opus)
+    (b"ID3", ".mp3"),       # MP3 with ID3 tag
+)
+
+
+def _sniff_ext(b: bytes) -> str:
+    """Best-effort audio container extension from magic bytes (fail-safe .wav)."""
+    for magic, ext in _MAGIC_EXTS:
+        if b.startswith(magic):
+            return ext
+    # MPEG audio frame sync (MP3 without an ID3 header): 0xFF Ex/Fx.
+    if len(b) >= 2 and b[0] == 0xFF and (b[1] & 0xE0) == 0xE0:
+        return ".mp3"
+    # ISO-BMFF (m4a/aac): '....ftyp' at offset 4.
+    if len(b) >= 12 and b[4:8] == b"ftyp":
+        return ".m4a"
+    return ".wav"
+
+
+def _named(path_field, blob: bytes, index: int) -> str:
+    """Filename with a real audio extension, recovered from bytes when needed."""
+    base = os.path.basename(path_field) if path_field else ""
+    root, ext = os.path.splitext(base)
+    if ext.lower() in {".wav", ".flac", ".mp3", ".ogg", ".opus", ".m4a", ".aac"}:
+        return base
+    stem = root or base or f"clip_{index:06d}"
+    return stem + _sniff_ext(blob)
+
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
@@ -61,9 +96,9 @@ def main(argv=None) -> int:
                 if written >= args.limit:
                     break
                 b = a.get("bytes")
-                name = os.path.basename(a.get("path") or f"clip_{written:06d}")
                 if not b:
                     continue
+                name = _named(a.get("path"), b, written)
                 dst = os.path.join(args.out, name)
                 with open(dst, "wb") as fh:
                     fh.write(b)

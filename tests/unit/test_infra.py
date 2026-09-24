@@ -34,6 +34,27 @@ def test_approved_source_redistributable():
     assert d.rights_status == RightsStatus.REDISTRIBUTION_APPROVED and d.redistribution_permitted
 
 
+def test_license_from_declaration_propagates():
+    # A per-source rights declaration carries the license so the published card /
+    # RELEASE_READY records real attribution terms instead of UNKNOWN.
+    gate = PermissionGate({"S1": {"rights_status": "REDISTRIBUTION_APPROVED",
+                                  "redistribution_permitted": True,
+                                  "source_license": "CC-BY-NC-SA-4.0"}})
+    assert gate.evaluate("S1", "file:///x").source_license == "CC-BY-NC-SA-4.0"
+
+
+def test_license_per_file_overrides_declaration():
+    gate = PermissionGate({"S1": {"rights_status": "REDISTRIBUTION_APPROVED",
+                                  "redistribution_permitted": True,
+                                  "source_license": "CC-BY-NC-SA-4.0"}})
+    d = gate.evaluate("S1", "file:///x", declared_license="CC-BY-4.0")
+    assert d.source_license == "CC-BY-4.0"
+
+
+def test_license_unknown_without_declaration():
+    assert PermissionGate({}).evaluate("S1", "file:///x").source_license == "UNKNOWN"
+
+
 def test_release_row_validate_rejects_absolute_path():
     row = ReleaseRow(audio_id="a", audio="/abs/x.wav", language="vi", speaker_id="s",
                      transcript="t", sample_rate=24000, channels=1, encoding="PCM_S16LE",
