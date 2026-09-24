@@ -154,6 +154,14 @@ chục tham số.
 - **R2 — HF đích thiếu quota/quyền:** preflight hiện chỉ `repo_info`, chưa check
   quota. Xác minh storage quota + repo policy + quyền redistribute trước khi
   campaign tự động chạy.
+  **[G3 ĐÃ XỬ LÝ — có research]** Hub KHÔNG có API công khai đọc quota còn lại
+  (huggingface_hub 1.33.0 không có method quota/usage; docs chỉ xem thủ công
+  trên billing page). Nên hạ cam kết: quota do operator KHAI
+  (`destination.max_bytes`), hệ thống đo dung lượng repo đích thật qua
+  `list_repo_tree` và fail-closed khi `hiện tại + dự kiến > quota`; thiếu khai
+  báo là warning (không silent-pass). Thêm check cứng 500GB/file mỗi docs và cờ
+  `redistribution_confirmed` do operator xác nhận. Preflight campaign + enforce
+  lại từng release.
 - **R3 — Cleanup mất khả năng recovery:** sau xóa local vẫn cần checkpoint,
   metadata, evidence, remote refs để kiểm chứng; dữ liệu chưa publish/review
   không chung chính sách với release đã xác minh.

@@ -442,6 +442,40 @@ def cmd_campaign_cleanup(args) -> int:
     return 0 if rep.get("ok") else 3
 
 
+def cmd_campaign_preflight(args) -> int:
+    from .campaign import CampaignStore, campaign_preflight
+
+    store = CampaignStore(args.root)
+    try:
+        store.load_campaign()
+    except FileNotFoundError:
+        _print({"error": f"no campaign in {store.root}"})
+        return 2
+    try:
+        rep = campaign_preflight(store)
+    except Exception as e:
+        _print({"error": f"destination preflight failed: {e}"})
+        return 3
+    _print(rep)
+    return 0 if rep.get("ok") else 3
+
+
+def cmd_campaign_report(args) -> int:
+    from .campaign import CampaignStore, campaign_report, dry_run_plan
+
+    store = CampaignStore(args.root)
+    try:
+        rep = dry_run_plan(store) if args.dry_run else campaign_report(store)
+    except FileNotFoundError:
+        _print({"error": f"no campaign in {store.root}"})
+        return 2
+    if args.out:
+        write_json(args.out, rep)
+        rep = {**rep, "written": args.out}
+    _print(rep)
+    return 0
+
+
 def cmd_campaign_pump(args) -> int:
     from .campaign import (
         Budget,
@@ -468,6 +502,18 @@ def cmd_campaign_pump(args) -> int:
     ledger = ReservationLedger(budget.stage_caps)
     gate_wm = WatermarkGate(budget.high_watermark_bytes,
                             budget.low_watermark_bytes)
+    if args.approval_dir and not args.skip_preflight:
+        # R2/G3: fail-closed destination preflight before an automatic run.
+        try:
+            from .campaign import campaign_preflight
+
+            pf = campaign_preflight(store)
+        except Exception as e:
+            _print({"error": f"destination preflight failed: {e}"})
+            return 3
+        if not pf.get("ok"):
+            _print({"refused": "destination preflight", "preflight": pf})
+            return 3
     cfg = DownloadConfig(file_workers=args.workers)
     pipe = None
     if args.policy:
@@ -489,7 +535,8 @@ def cmd_campaign_pump(args) -> int:
         if not args.approval_dir or not args.repo:
             return {"ok": False, "reason": "no-approval-dir"}
         ap = os.path.join(args.approval_dir, f"{rid}.yaml")
-        return publish_release(store, rid, args.repo, ap, full_hash=True)
+        return publish_release(store, rid, args.repo, ap, full_hash=True,
+                               destination=campaign.destination)
 
     rep = pump_campaign(
         store, ledger, gate_wm, _download, _qc,
@@ -679,8 +726,19 @@ def build_parser() -> argparse.ArgumentParser:
     cpump.add_argument("--max-steps", type=int, default=100)
     cpump.add_argument("--overlap", action="store_true",
                        help="download the next batch while QC runs (G1)")
+    cpump.add_argument("--skip-preflight", action="store_true",
+                       help="do not refuse to run when destination preflight fails")
     wd(cpump)
     cpump.set_defaults(func=cmd_campaign_pump)
+    cpf = cpsub.add_parser("preflight", help="destination quota/access preflight (G3)")
+    cpf.add_argument("--root", required=True)
+    cpf.set_defaults(func=cmd_campaign_preflight)
+    crep = cpsub.add_parser("report", help="campaign report or dry-run plan (G4)")
+    crep.add_argument("--root", required=True)
+    crep.add_argument("--out", default=None)
+    crep.add_argument("--dry-run", action="store_true",
+                      help="read-only next-action preview; mutates nothing")
+    crep.set_defaults(func=cmd_campaign_report)
     return p
 
 

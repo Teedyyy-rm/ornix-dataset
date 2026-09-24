@@ -6,6 +6,13 @@ name: demo-campaign
 destination:
   repo_id: YOUR_ORG/ornix-releases
   repo_type: dataset
+  # The Hub exposes no public quota API; declare your account/repo quota here
+  # (read it from https://huggingface.co/settings/billing). Preflight fails
+  # closed when current + projected would exceed it. Omit => warning only.
+  max_bytes: 200000000000
+  # Operator must explicitly confirm the right to redistribute to this
+  # destination, independently of the approval receipt.
+  redistribution_confirmed: true
 publish_approved: false
 workspace:
   max_bytes: 120000000000

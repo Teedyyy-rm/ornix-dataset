@@ -60,3 +60,18 @@ A campaign runs multiple datasets end-to-end on real state: upload, verify,
 clean intermediates, continue automatically, recover after interruption.
 **Performance is VERIFIED for orchestration overhead only**; production
 throughput stays PERFORMANCE_UNVERIFIED pending live benchmarks.
+
+## Post-audit additions (G1–G4)
+
+- **G1/G2 (commit `b39e156`):** overlapped pump (`--overlap`: download-next
+  while QC-current, admitted up-front) and true per-file handoff (downloader
+  restructured to a 3-stage pipeline so `on_ready` fires mid-run). Tests:
+  overlap faster-than-sequential, mid-run handoff, ledger thread-safety.
+- **G3 (this commit):** destination preflight (`campaign preflight`). Research
+  finding: the Hub exposes **no public quota API** — quota is operator-declared
+  (`destination.max_bytes`), measured against `list_repo_tree`, fail-closed;
+  undeclared => warning; plus the 500 GB single-file hard limit and
+  `redistribution_confirmed`. Enforced at campaign level and per-release.
+- **G4 (this commit):** `campaign report` (one aggregate artifact: statuses,
+  blockers, releases, cleanup footprint, `--out`) and `campaign report
+  --dry-run` (read-only next-action preview, mutates nothing).

@@ -45,6 +45,15 @@ from .publishing import (
     staging_revision_for,
 )
 from .planning import plan_batches
+from .preflight import (
+    HARD_MAX_FILE_BYTES,
+    DestinationPreflight,
+    campaign_preflight,
+    check_destination,
+    expected_upload_bytes,
+    oversized_files,
+    repo_current_bytes,
+)
 from .refs import (
     canonical_repo_id,
     default_resolver,
@@ -52,6 +61,7 @@ from .refs import (
     normalize_repo_ref,
     pin_revision,
 )
+from .report import campaign_report, dry_run_plan
 from .resources import (
     STAGES,
     BatchPlan,
@@ -74,6 +84,8 @@ __all__ = [
     "CampaignStore",
     "CleanupPolicy",
     "DatasetJob",
+    "DestinationPreflight",
+    "HARD_MAX_FILE_BYTES",
     "JobStatus",
     "MANIFEST_NAME",
     "ReservationLedger",
@@ -81,11 +93,16 @@ __all__ = [
     "WatermarkGate",
     "batch_id_for",
     "batch_staging_dir",
+    "campaign_preflight",
+    "campaign_report",
     "canonical_repo_id",
+    "check_destination",
     "cleanup_batch",
     "default_resolver",
     "downloaded_files",
+    "dry_run_plan",
     "eligibility",
+    "expected_upload_bytes",
     "fetch_job_inventory",
     "gate_batch_release",
     "gate_receipt_path",
@@ -96,6 +113,7 @@ __all__ = [
     "manifest_path",
     "manifest_to_source_record",
     "normalize_repo_ref",
+    "oversized_files",
     "path_prefix_for",
     "pin_revision",
     "plan_batches",
@@ -112,6 +130,7 @@ __all__ = [
     "release_dir_for",
     "release_file_inventory",
     "release_id_for",
+    "repo_current_bytes",
     "run_batch",
     "run_qc_batch",
     "staging_revision_for",

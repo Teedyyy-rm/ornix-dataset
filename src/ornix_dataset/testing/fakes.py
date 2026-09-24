@@ -98,8 +98,11 @@ class FakeHub:
         self.upload_failures: list = []
         self.upload_calls = 0
         self.branches: List[str] = []
+        self.missing_repos: set = set()
 
     def repo_info(self, repo_id: str, repo_type: str = "dataset") -> Dict[str, str]:
+        if repo_id in self.missing_repos:
+            raise RuntimeError(f"404 repo not found: {repo_id}")
         return {"id": repo_id}
 
     def create_branch(self, repo_id: str, branch: str,
@@ -128,6 +131,13 @@ class FakeHub:
     def list_repo_files(self, repo_id: str, repo_type: str = "dataset",
                         revision: Optional[str] = None) -> List[str]:
         return list(self.remote)
+
+    def list_repo_tree(self, repo_id: str, revision: Optional[str] = None,
+                       repo_type: str = "dataset", recursive: bool = True
+                       ) -> List[Any]:
+        from types import SimpleNamespace
+        return [SimpleNamespace(type="file", path=p, size=len(b), lfs={})
+                for p, b in self.remote.items()]
 
 
 def fake_download_factory(hub: FakeHub):

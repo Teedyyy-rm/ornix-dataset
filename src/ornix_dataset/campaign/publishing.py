@@ -27,9 +27,18 @@ from ..util.io import read_json, write_json
 from ..util.jsonl import load_jsonl
 from ..util.timeutil import utc_now_iso
 from .models import BatchStatus
+from .preflight import oversized_files
 from .processing import gate_receipt_path, qc_paths
 
 RELEASES_DIR = "releases"
+
+
+def _dir_bytes(path: str) -> int:
+    total = 0
+    for dp, _ds, fs in os.walk(path):
+        for f in fs:
+            total += os.path.getsize(os.path.join(dp, f))
+    return total
 
 
 def release_id_for(campaign_id: str, job_id: str, batch_id: str) -> str:
@@ -101,6 +110,11 @@ def prepare_release(store: Any, job_id: str, batch_id: str,
                                                 "see BATCH evidence in QC run"},
                         export_format=export_format,
                         release_target=release_target)
+    oversized = oversized_files(out)
+    if oversized:
+        art.ready = False
+        art.blockers = list(art.blockers) + [
+            f"HUB_FILE_HARD_LIMIT:{o['path']}:{o['bytes']}" for o in oversized]
     record = {"release_id": release_id, "campaign_id": campaign.campaign_id,
               "job_id": job.job_id, "batch_id": batch.batch_id,
               "repo_target": (campaign.destination or {}).get("repo_id"),
@@ -128,10 +142,33 @@ def release_file_inventory(release_dir: str) -> Dict[str, str]:
 
 def publish_release(store: Any, release_id: str, repo_id: str,
                     approval_path: str, full_hash: bool = False,
-                    upload_retries: int = 3) -> Dict[str, Any]:
-    """Upload a prepared release; write the REMOTE_VERIFIED receipt on success."""
+                    upload_retries: int = 3,
+                    destination: Optional[Dict[str, Any]] = None,
+                    api: Any = None) -> Dict[str, Any]:
+    """Upload a prepared release; write the REMOTE_VERIFIED receipt on success.
+
+    If ``destination`` declares ``max_bytes``, the destination's real size is
+    measured first and the upload is refused when it would exceed the quota
+    (G3) — a second, per-release enforcement of the campaign-level preflight.
+    """
     record = read_json(record_path_for(store, release_id))
     release_dir = record["release_dir"]
+    if destination and destination.get("max_bytes") is not None:
+        from .preflight import check_destination, repo_current_bytes
+
+        if api is None:
+            from huggingface_hub import HfApi
+            api = HfApi(token=os.environ.get("HF_TOKEN"))
+        add = _dir_bytes(release_dir)
+        try:
+            pf = check_destination(api, destination, projected_bytes=add,
+                                   repo_id=repo_id)
+        except Exception as e:
+            return {"ok": False, "status": "BLOCKED",
+                    "reasons": [f"DESTINATION_PREFLIGHT_FAILED:{e}"]}
+        if not pf.ok:
+            return {"ok": False, "status": "BLOCKED", "reasons": pf.reasons,
+                    "preflight": pf.to_dict()}
     pub = StagedPublisher()
     res = pub.publish(release_dir, repo_id, dry_run=False,
                       approval_path=approval_path,
