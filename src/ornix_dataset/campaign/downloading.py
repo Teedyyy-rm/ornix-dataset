@@ -28,12 +28,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..ingestion.hf_downloader import (
     DownloadConfig,
+    DownloadResult,
     HfBatchDownloader,
     InventoryItem,
     matches_patterns,
 )
 from ..util.io import atomic_write_text
-from ..util.jsonl import load_jsonl
+from ..util.jsonl import append_jsonl, load_jsonl
 from .models import BatchStatus, DatasetJob
 from .resources import ReservationLedger, try_admit
 
@@ -113,6 +114,19 @@ def _flat_staged_name(item: InventoryItem) -> str:
     return item.path_in_repo.replace("/", "__")
 
 
+def _manifest_row(job: DatasetJob, res: Any, staging: str) -> Dict[str, Any]:
+    return {
+        "source_uri": f"hf://datasets/{job.repo_id}"
+                      f"@{job.pinned_sha}/{res.path_in_repo}",
+        "original_file_id": res.path_in_repo,
+        "source_revision": job.pinned_sha,
+        "staged_path": os.path.relpath(res.staged_path, staging),
+        "sha256": res.sha256, "size": res.size,
+        "verify_method": res.verify_method,
+        "from_cache": bool(res.from_cache),
+        "reused_staged": bool(res.reused_staged)}
+
+
 def run_batch(store: Any, job_id: str, batch_id: str,
               caps: Dict[str, int], min_free_bytes: int,
               ledger: Optional[ReservationLedger] = None,
@@ -120,11 +134,15 @@ def run_batch(store: Any, job_id: str, batch_id: str,
               tree: Optional[Dict[str, Tuple[Optional[int], Optional[str]]]] = None,
               download_fn: Optional[Callable[..., str]] = None,
               cache_check_fn: Optional[Callable[..., Optional[str]]] = None,
+              _admitted: bool = False,
               ) -> Dict[str, Any]:
     """Download one batch's files into verified staging. Error boundary included.
 
     Returns a report; raises nothing except unexpected (non-Exception) faults.
     A batch whose manifest already covers every file is a no-op success.
+
+    ``_admitted``: the caller already holds this batch's ledger reservation
+    (pump overlap path) — skip admission but still release in ``finally``.
     """
     job = store.load_job(job_id)
     if not job.pinned_sha:
@@ -160,7 +178,9 @@ def run_batch(store: Any, job_id: str, batch_id: str,
     free = shutil.disk_usage(store.root).free
     # Incomplete batches stay PLANNED (see _execute), so try_admit is the only
     # admission path: no reservation => the batch does not start. Period.
-    if not try_admit(batch, ledger, free, min_free_bytes):
+    # (_admitted skips this: the overlap worker's reservation was taken by the
+    # pump thread before spawning, and is released in the finally below.)
+    if not _admitted and not try_admit(batch, ledger, free, min_free_bytes):
         return {"ok": False, "admitted": False,
                 "reason": "no-reservation-or-disk"}
     os.makedirs(staging, exist_ok=True)
@@ -202,9 +222,19 @@ def _execute(store: Any, job: DatasetJob, batch: Any, staging: str,
                            cfg=cfg or DownloadConfig(),
                            download_fn=download_fn,
                            cache_check_fn=cache_check_fn)
+
+    def _on_ready(res: DownloadResult) -> None:
+        # Per-file handoff (G2): checkpoint mark + manifest row land the moment
+        # the file is verified-staged — a crash or a concurrent QC tail never
+        # waits for the whole batch. on_ready runs on the drain (calling)
+        # thread, in completion order.
+        ckpt.mark(res.path_in_repo, "DOWNLOADED", sha256=res.sha256,
+                  staged_path=res.staged_path, size=res.size)
+        append_jsonl(manifest_path(staging), _manifest_row(job, res, staging))
+
     try:
         results = dl.run(items, staged_name=_flat_staged_name,
-                         skip_staged=skip_staged)
+                         skip_staged=skip_staged, on_ready=_on_ready)
     except Exception as e:
         batch.result = {**(batch.result or {}),
                         "download": {"complete": False, "error": str(e)}}
@@ -212,26 +242,20 @@ def _execute(store: Any, job: DatasetJob, batch: Any, staging: str,
         return {"ok": False, "admitted": True, "reason": "download-error",
                 "error": str(e)}
 
-    rows = [r for r in read_manifest(staging)]
-    known = {r.get("original_file_id") for r in rows}
+    # Reconcile: streamed rows + any pre-existing rows, deduped and ordered.
+    # The atomic rewrite is what guarantees no duplicate rows across retries.
+    merged: Dict[str, Dict[str, Any]] = {}
+    for r in read_manifest(staging):
+        if r.get("original_file_id"):
+            merged[r["original_file_id"]] = r
+    for res in results:
+        merged[res.path_in_repo] = _manifest_row(job, res, staging)
+    rows = [merged[k] for k in sorted(merged)]
+    _write_manifest(staging, rows)
     for res in results:
         ckpt.mark(res.path_in_repo, "DOWNLOADED", sha256=res.sha256,
                   staged_path=res.staged_path, size=res.size)
-        if res.path_in_repo not in known:
-            rows.append({
-                "source_uri": f"hf://datasets/{job.repo_id}"
-                              f"@{job.pinned_sha}/{res.path_in_repo}",
-                "original_file_id": res.path_in_repo,
-                "source_revision": job.pinned_sha,
-                "staged_path": os.path.relpath(res.staged_path, staging),
-                "sha256": res.sha256, "size": res.size,
-                "verify_method": res.verify_method,
-                "from_cache": bool(res.from_cache),
-                "reused_staged": bool(res.reused_staged)})
-            known.add(res.path_in_repo)
-    # atomic rewrite: no duplicate rows across retries, ever
-    rows.sort(key=lambda r: r.get("original_file_id", ""))
-    _write_manifest(staging, rows)
+    known = set(merged)
 
     complete = known.issuperset(batch.files)
     summary = {"complete": complete,

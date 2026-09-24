@@ -168,19 +168,27 @@ def cleanup_batch(store: Any, job_id: str, batch_id: str,
 
 
 def pump_campaign(store: Any, ledger: Any, gate: Any,
-                  download_one: Callable[[str, str], Dict[str, Any]],
+                  download_one: Callable[..., Dict[str, Any]],
                   qc_one: Callable[[str, str], Dict[str, Any]],
                   gate_one: Callable[[str, str], Dict[str, Any]],
                   prepare_one: Optional[Callable[[str, str], Dict[str, Any]]] = None,
                   publish_one: Optional[Callable[[str], Dict[str, Any]]] = None,
                   cleanup_one: Optional[Callable[[str, str], Dict[str, Any]]] = None,
-                  max_steps: int = 100) -> Dict[str, Any]:
+                  max_steps: int = 100, overlap: bool = False,
+                  min_free_bytes: int = 0) -> Dict[str, Any]:
     """Drive the job queue automatically within watermark and step budgets.
 
     One step = one action on one batch (download, QC, gate, prepare, publish,
     cleanup). Jobs run in campaign order; a job whose batches are all DONE is
     marked DONE. Publish without a callback is recorded as awaiting-publish
     (approval is an operator act, never automated here).
+
+    ``overlap`` (G1): while the main thread runs QC on one batch, a single
+    background worker downloads the next PLANNED batch — its reservation is
+    admitted up-front in the main thread (watermark + ledger), the worker runs
+    ``download_one(job, batch, admitted=True)`` and releases on completion.
+    Batches are disjoint (own staging/checkpoint/QC dirs), so the two threads
+    never share mutable state except the locked ledger.
     """
     from shutil import disk_usage
 
@@ -204,9 +212,24 @@ def pump_campaign(store: Any, ledger: Any, gate: Any,
         while progressed and steps < max_steps:
             progressed = False
             job = store.load_job(job_id)
+            if overlap and steps < max_steps and _overlap_step(
+                    store, ledger, gate, job, download_one, qc_one,
+                    min_free_bytes, _step):
+                progressed = True
+                job = store.load_job(job_id)
+                states = [store.load_batch(x).status for x in job.batch_ids]
+                if job.batch_ids and all(
+                        s == BatchStatus.DONE.value for s in states) \
+                        and job.status != "DONE":
+                    job.status = "DONE"
+                    store.save_job(job)
+                    log.append({"step": steps + 1, "action": "job-done",
+                                "job": job_id, "batch": ""})
+                continue
             for bid in list(job.batch_ids):
                 if steps >= max_steps:
                     break
+                mark = len(log)
                 b = store.load_batch(bid)
                 st = b.status
                 if st == BatchStatus.PLANNED.value:
@@ -266,6 +289,11 @@ def pump_campaign(store: Any, ledger: Any, gate: Any,
                         if not _step("awaiting-publish", job_id, bid):
                             return _report(campaign, log, steps)
                 # DONE batches need nothing
+                # Overlap mode acts on one batch per pass so the next pass can
+                # pair QC-current with download-next (G1); sequential mode
+                # keeps the old drain-everything behavior.
+                if overlap and len(log) != mark:
+                    break
             job = store.load_job(job_id)
             states = [store.load_batch(x).status for x in job.batch_ids]
             if job.batch_ids and all(s == BatchStatus.DONE.value for s in states) \
@@ -275,6 +303,63 @@ def pump_campaign(store: Any, ledger: Any, gate: Any,
                 log.append({"step": steps + 1, "action": "job-done",
                             "job": job_id, "batch": ""})
     return _report(campaign, log, steps)
+
+
+def _overlap_step(store: Any, ledger: Any, gate: Any, job: Any,
+                  download_one: Callable[..., Dict[str, Any]],
+                  qc_one: Callable[[str, str], Dict[str, Any]],
+                  min_free_bytes: int, _step: Callable[..., bool]) -> bool:
+    """One overlapped pair: QC current batch while downloading the next.
+
+    Returns True when a pair ran (caller re-loops). Admission happens here in
+    the main thread; the worker only executes the admitted download.
+    """
+    from shutil import disk_usage
+
+    from .resources import try_admit
+
+    qc_bid, dl_bid = None, None
+    for bid in job.batch_ids:
+        b = store.load_batch(bid)
+        if qc_bid is None and b.status == BatchStatus.IN_PROGRESS.value \
+                and (b.result or {}).get("download", {}).get("complete"):
+            qc_bid = bid
+        elif dl_bid is None and b.status == BatchStatus.PLANNED.value:
+            dl_bid = bid
+        if qc_bid and dl_bid:
+            break
+    if not qc_bid or not dl_bid:
+        return False
+    if gate.evaluate(disk_usage(store.root).free) != "run":
+        return False
+    dl_batch = store.load_batch(dl_bid)
+    if not try_admit(dl_batch, ledger,
+                     disk_usage(store.root).free, min_free_bytes):
+        return False  # reservation unavailable: sequential path handles it
+
+    import threading as _th
+    worker_rep: Dict[str, Any] = {}
+
+    def _worker() -> None:
+        try:
+            worker_rep.update(download_one(job.job_id, dl_bid, True))
+        except Exception as e:  # never let a worker thread die silently
+            worker_rep.update({"ok": False, "admitted": True,
+                               "reason": f"worker-error: {e}"})
+
+    t = _th.Thread(target=_worker, name=f"pump-dl-{dl_bid}", daemon=True)
+    t.start()
+    try:
+        qc_rep = qc_one(job.job_id, qc_bid)
+    finally:
+        t.join(timeout=3600)
+    if t.is_alive():
+        return False  # worker hung: leave states as-is, sequential retry later
+    _step("download", job.job_id, dl_bid, {"ok": worker_rep.get("ok"),
+                                           "overlapped": True})
+    _step("qc", job.job_id, qc_bid, {"ok": qc_rep.get("ok"),
+                                     "overlapped": True})
+    return True
 
 
 def _report(campaign: Any, log: List[Dict[str, Any]], steps: int) -> Dict[str, Any]:

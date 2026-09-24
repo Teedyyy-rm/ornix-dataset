@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import shutil
+import threading
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -212,42 +213,54 @@ def plan_with_budget(repo_id: str, pinned_sha: str, job_id: Optional[str],
 
 
 class ReservationLedger:
-    """Runtime holder of reservations. Acquire BEFORE a batch starts work."""
+    """Runtime holder of reservations. Acquire BEFORE a batch starts work.
+
+    Thread-safe: the pump overlap worker acquires in the main thread and
+    releases from the worker thread.
+    """
 
     def __init__(self, caps: Dict[str, int]):
         self.caps = {s: int(caps.get(s, 0)) for s in STAGES}
         self.used: Dict[str, int] = {s: 0 for s in STAGES}
         self.held: Dict[str, Dict[str, int]] = {}
+        self._lock = threading.Lock()
 
     def fits(self, reservation: Dict[str, int]) -> bool:
+        with self._lock:
+            return self._fits_locked(reservation)
+
+    def _fits_locked(self, reservation: Dict[str, int]) -> bool:
         return all(self.used[s] + int(reservation.get(s, 0)) <= self.caps[s]
                    for s in STAGES)
 
     def acquire(self, batch: Batch) -> bool:
         """Hold a PLANNED batch's reservation. False => must not start."""
-        if batch.status != BatchStatus.PLANNED.value:
-            return False
-        if batch.batch_id in self.held:
-            return False  # already held: no double-acquire
-        need = {s: int(batch.reservation.get(s, 0)) for s in STAGES}
-        if not self.fits(batch.reservation):
-            return False
-        for s in STAGES:
-            self.used[s] += need[s]
-        self.held[batch.batch_id] = need
-        return True
+        with self._lock:
+            if batch.status != BatchStatus.PLANNED.value:
+                return False
+            if batch.batch_id in self.held:
+                return False  # already held: no double-acquire
+            need = {s: int(batch.reservation.get(s, 0)) for s in STAGES}
+            if not self._fits_locked(batch.reservation):
+                return False
+            for s in STAGES:
+                self.used[s] += need[s]
+            self.held[batch.batch_id] = need
+            return True
 
     def release(self, batch_id: str) -> bool:
-        need = self.held.pop(batch_id, None)
-        if need is None:
-            return False
-        for s in STAGES:
-            self.used[s] = max(0, self.used[s] - need[s])
-        return True
+        with self._lock:
+            need = self.held.pop(batch_id, None)
+            if need is None:
+                return False
+            for s in STAGES:
+                self.used[s] = max(0, self.used[s] - need[s])
+            return True
 
     def totals(self) -> Dict[str, Any]:
-        return {"caps": dict(self.caps), "used": dict(self.used),
-                "held_batches": sorted(self.held)}
+        with self._lock:
+            return {"caps": dict(self.caps), "used": dict(self.used),
+                    "held_batches": sorted(self.held)}
 
 
 class WatermarkGate:

@@ -473,10 +473,10 @@ def cmd_campaign_pump(args) -> int:
     if args.policy:
         pipe = _build_pipeline(args)
 
-    def _download(j, b):
+    def _download(j, b, admitted=False):
         return run_batch(store, j, b, caps=budget.stage_caps,
                          min_free_bytes=budget.min_free_bytes,
-                         ledger=ledger, cfg=cfg)
+                         ledger=ledger, cfg=cfg, _admitted=admitted)
 
     def _qc(j, b):
         if pipe is None:
@@ -497,7 +497,8 @@ def cmd_campaign_pump(args) -> int:
         prepare_one=lambda j, b: prepare_release(store, j, b),
         publish_one=_publish if args.approval_dir else None,
         cleanup_one=lambda j, b: cleanup_batch(store, j, b, ledger=ledger),
-        max_steps=args.max_steps)
+        max_steps=args.max_steps, overlap=args.overlap,
+        min_free_bytes=budget.min_free_bytes)
     _print(rep)
     return 0
 
@@ -676,6 +677,8 @@ def build_parser() -> argparse.ArgumentParser:
     cpump.add_argument("--approval-dir", default=None)
     cpump.add_argument("--repo", default=None)
     cpump.add_argument("--max-steps", type=int, default=100)
+    cpump.add_argument("--overlap", action="store_true",
+                       help="download the next batch while QC runs (G1)")
     wd(cpump)
     cpump.set_defaults(func=cmd_campaign_pump)
     return p

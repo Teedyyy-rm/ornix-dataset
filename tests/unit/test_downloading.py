@@ -204,3 +204,63 @@ def test_cli_download_and_inventory_fail_closed(tmp_path, capsys):
     assert main(["campaign", "download", "--root", root,
                  "--job", "nope", "--batch", "nope"]) == 2
     assert main(["campaign", "inventory", "--root", root, "--job", "nope"]) == 2
+
+
+# -- G2: per-file handoff ----------------------------------------------------------
+
+def test_verified_file_hands_off_before_batch_finishes(tmp_path):
+    """Handoff lands mid-run: while slow.wav is still downloading, some file
+    must already be checkpoint-marked AND present in BATCH_MANIFEST (no
+    batch-end wait). Completion order is arbitrary; the guarantee is timing."""
+    import time
+
+    from ornix_dataset.campaign import batch_staging_dir
+    from ornix_dataset.campaign.downloading import manifest_path
+
+    net = FakeNet(tmp_path)
+    net.add("fast.wav", os.urandom(1024))
+    net.add("slow.wav", os.urandom(1024))
+    store, jid, batches, budget = make_store(
+        tmp_path, [("fast.wav", 1024), ("slow.wav", 1024)])
+    (b,) = batches
+    staging = batch_staging_dir(store.root, jid, b.batch_id)
+    seen = {}
+
+    def _handler(path, force=False):
+        if path == "slow.wav":
+            # bounded wait for the first mid-run handoff (must land while
+            # this very download is still in flight)
+            deadline = time.monotonic() + 15
+            prog = None
+            while time.monotonic() < deadline:
+                prog = store.batch_checkpoint(
+                    store.load_batch(b.batch_id)).load()
+                if any(s == "DOWNLOADED" for s in prog.states.values()):
+                    break
+                time.sleep(0.02)
+            seen["ckpt"] = dict(prog.states)
+            seen["manifest"] = [
+                r.get("original_file_id")
+                for r in read_manifest(staging)] if os.path.exists(
+                    manifest_path(staging)) else []
+        p = os.path.join(net.dir, path.replace("/", "_"))
+        with open(p, "wb") as fh:
+            fh.write(net.payload[path])
+        return p
+
+    net.handler = _handler
+    ledger = ReservationLedger(budget.stage_caps)
+    rep = run_batch(store, jid, b.batch_id, caps=budget.stage_caps,
+                    min_free_bytes=1024, ledger=ledger,
+                    cfg=DownloadConfig(file_workers=1, retry_jitter=False),
+                    download_fn=net,
+                    tree={"fast.wav": (1024, net.sha("fast.wav")),
+                          "slow.wav": (1024, net.sha("slow.wav"))})
+    assert rep["ok"] is True
+    assert list(seen["ckpt"].values()) == ["DOWNLOADED"] or (
+        len(seen["ckpt"]) >= 1
+        and set(seen["ckpt"].values()) == {"DOWNLOADED"})
+    assert set(seen["manifest"]) <= {"fast.wav", "slow.wav"}
+    assert 1 <= len(seen["manifest"]) <= 2
+    rows = read_manifest(staging)
+    assert sorted(r["original_file_id"] for r in rows) == ["fast.wav", "slow.wav"]

@@ -293,3 +293,88 @@ def test_cli_cleanup_pump_fail_closed(tmp_path, capsys):
     assert main(["campaign", "cleanup", "--root", root,
                  "--job", "j", "--batch", "b"]) == 2
     assert main(["campaign", "pump", "--root", root]) == 2
+
+
+# -- G1: overlapped pump ----------------------------------------------------------
+
+def _overlap_world(tmp_path, tag):
+    import time as _t
+
+    net = FakeNet(tmp_path / tag)
+    net.delay = 0.4
+    for n in ("a.wav", "b.wav"):
+        net.add(n, os.urandom(2048))
+    store = CampaignStore(str(tmp_path / f"c-{tag}"))
+    _, out = store.create_campaign(f"ov-{tag}", [{"repo": f"org/A@{SHA}"}],
+                                   workspace={"min_free_bytes": 1024},
+                                   resolver=lambda r, v: SHA)
+    jid = out[0]["job_id"]
+    budget = Budget(workspace_max_bytes=100 * GB, min_free_bytes=1024,
+                    max_files_per_batch=1, max_batch_bytes=10 * GB)
+    batches = store.plan_job_batches(jid, [("a.wav", 2048), ("b.wav", 2048)],
+                                     budget=budget)
+    assert len(batches) == 2
+    ledger = ReservationLedger(budget.stage_caps)
+    wm = WatermarkGate(1024, 2048)
+    tree = {n: (2048, net.sha(n)) for n in ("a.wav", "b.wav")}
+
+    def _download(j, b, admitted=False):
+        return run_batch(store, j, b, caps=budget.stage_caps,
+                         min_free_bytes=1024, ledger=ledger,
+                         cfg=DownloadConfig(file_workers=1, retry_jitter=False),
+                         download_fn=net, tree=tree, _admitted=admitted)
+
+    def _qc(j, b):
+        return run_qc_batch(store, j, b, FakeAnalyzer(delay=0.4))
+
+    def _pump(overlap):
+        import time
+        t0 = time.monotonic()
+        rep = pump_campaign(
+            store, ledger, wm, _download, _qc,
+            lambda j, b: {"ok": False, "reason": "no-gate-in-this-test"},
+            max_steps=8, overlap=overlap, min_free_bytes=1024)
+        return rep, time.monotonic() - t0
+
+    return _pump
+
+
+def test_overlap_downloads_next_while_qc_runs(tmp_path):
+    seq_rep, seq_wall = _overlap_world(tmp_path, "seq")(False)
+    ov_rep, ov_wall = _overlap_world(tmp_path, "ov")(True)
+    for rep in (seq_rep, ov_rep):
+        by_id = {}
+        for e in rep["log"]:
+            by_id.setdefault(e["batch"], []).append(e["action"])
+        # both batches fully downloaded+QC'd in both modes
+        assert len(by_id) == 2
+    assert any(e.get("overlapped") for e in ov_rep["log"])
+    assert not any(e.get("overlapped") for e in seq_rep["log"])
+    assert ov_wall < seq_wall  # one full stage saved by overlapping
+
+
+def test_overlap_yields_to_watermark(tmp_path):
+    net = FakeNet(tmp_path)
+    net.add("a.wav", os.urandom(64))
+    store = CampaignStore(str(tmp_path / "c"))
+    _, out = store.create_campaign("ovw", [{"repo": f"org/A@{SHA}"}],
+                                   workspace={"min_free_bytes": 1024},
+                                   resolver=lambda r, v: SHA)
+    jid = out[0]["job_id"]
+    budget = Budget(workspace_max_bytes=100 * GB, min_free_bytes=1024,
+                    max_files_per_batch=10, max_batch_bytes=10 * GB)
+    batches = store.plan_job_batches(jid, [("a.wav", 64)], budget=budget)
+    ledger = ReservationLedger(budget.stage_caps)
+    closed = WatermarkGate(high_watermark_bytes=10**30,
+                           low_watermark_bytes=10**30)
+    rep = pump_campaign(
+        store, ledger, closed,
+        lambda j, b, admitted=False: run_batch(
+            store, j, b, caps=budget.stage_caps, min_free_bytes=1024,
+            ledger=ledger, download_fn=net, _admitted=admitted),
+        lambda j, b: {"ok": False},
+        lambda j, b: {"ok": False},
+        max_steps=4, overlap=True, min_free_bytes=1024)
+    assert any(e["action"] == "stopped-disk" for e in rep["log"])
+    assert net.calls == []
+    assert store.load_batch(batches[0].batch_id).status == "PLANNED"

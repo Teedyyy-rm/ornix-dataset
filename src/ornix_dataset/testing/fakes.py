@@ -24,6 +24,7 @@ class FakeNet:
         self.lock = threading.Lock()
         self.barrier: Optional[threading.Barrier] = None
         self.delay = 0.0
+        self.handler = None  # optional (path, force) -> str override
         self.peak = 0
         self.active = 0
 
@@ -34,6 +35,11 @@ class FakeNet:
         return hashlib.sha256(self.payload[path]).hexdigest()
 
     def __call__(self, path: str, force: bool = False) -> str:
+        # NOTE: tests override `handler`, never `__call__`.
+        if self.handler is not None:
+            with self.lock:
+                self.calls.append(path)
+            return self.handler(path, force)
         with self.lock:
             self.calls.append(path)
             self.active += 1

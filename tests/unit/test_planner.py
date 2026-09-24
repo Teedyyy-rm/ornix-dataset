@@ -171,6 +171,37 @@ def test_budget_from_real_disk_and_fail_closed(tmp_path):
 
 # -- store + CLI integration -------------------------------------------------------
 
+def test_ledger_thread_safe_acquire_release():
+    import threading
+
+    plan = plan_with_budget("org/T", SHA, None, files(8, 1000), small_budget())
+    ledger = ReservationLedger(small_budget().stage_caps)
+    results = []
+    # two contenders per batch; barrier separates the acquire phase from the
+    # release phase so no winner can release before its rival attempted.
+    gate = threading.Barrier(len(plan.batches) * 2)
+
+    def _work(b):
+        ok = ledger.acquire(b)
+        results.append((b.batch_id, ok))
+        gate.wait(timeout=30)
+        if ok:
+            ledger.release(b.batch_id)
+
+    threads = [threading.Thread(target=_work, args=(b,))
+               for b in plan.batches for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads)
+    # each batch acquired at most once wins exactly once (no double-acquire)
+    wins = [bid for bid, ok in results if ok]
+    assert sorted(wins) == sorted(b.batch_id for b in plan.batches)
+    assert all(v == 0 for v in ledger.totals()["used"].values())
+    assert ledger.totals()["held_batches"] == []
+
+
 def test_replan_preserves_completed_progress(tmp_path):
     store = CampaignStore(str(tmp_path / "c"))
     _, out = store.create_campaign(

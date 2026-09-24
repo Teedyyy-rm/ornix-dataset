@@ -678,9 +678,13 @@ class HfBatchDownloader:
             ) -> List[DownloadResult]:
         """Download+verify+stage a batch; returns results in INVENTORY ORDER.
 
+        Three stages run as a true pipeline: the calling thread produces
+        (submits net jobs), the net/io pools download+verify, and a drainer
+        thread collects verified results in completion order and fires
+        ``on_ready`` per file — while the remaining downloads still run.
         Out-of-order completion never changes manifest order (single ordered
-        writer here in the calling thread). Fatal errors stop the producer,
-        running tasks finish cleanly, then the first error is raised.
+        writer in the drainer). Fatal errors stop the producer, running tasks
+        finish cleanly, then the first error is raised.
         """
         self._check_ram_guard()
         self._check_disk(sum(i.size for i in items))
@@ -746,23 +750,16 @@ class HfBatchDownloader:
                 with self._io_lock:
                     self._io_done += 1
 
-        try:
-            with ThreadPoolExecutor(max_workers=self.cfg.verify_workers,
-                                    thread_name_prefix="ornix-io") as io_pool:
-                with ThreadPoolExecutor(max_workers=min(self.cfg.file_workers,
-                                                         HARD_MAX_FILE_WORKERS),
-                                        thread_name_prefix="ornix-net") as net_pool:
-                    for item in pending:
-                        if self._abort is not None:
-                            break
-                        self._check_disk(item.size)
-                        self._budget.acquire(item.size)  # never submit-all (T3)
-                        net_pool.submit(net_job, item)
-                # net stage closed: no more io submissions after this point
-                with self._io_lock:
-                    self._io_open = False
-                # drain in COMPLETION order; after an abort results are still
-                # consumed (never block a producer) but discarded, never READY.
+        # per-run stage counters (an instance may run several batches; the
+        # abort flag stays sticky fail-closed across runs)
+        with self._io_lock:
+            self._io_open = True
+            self._io_submitted = 0
+            self._io_done = 0
+        drainer_exc: List[BaseException] = []
+
+        def _drain() -> None:
+            try:
                 deadline = time.monotonic() + 3600
                 while time.monotonic() < deadline:
                     with self._io_lock:
@@ -780,7 +777,38 @@ class HfBatchDownloader:
                             self.metrics.peak_ready_depth = max(
                                 self.metrics.peak_ready_depth, self._ready.qsize())
                         if on_ready is not None:
+                            # Serial per-file handoff, coupled to consumption:
+                            # a slow observer throttles the drain, the bounded
+                            # queue throttles io, the byte budget throttles the
+                            # producer — bounded memory end to end (T4).
                             on_ready(res)
+            except BaseException as exc:  # noqa: BLE001 - surface in caller
+                self._set_abort(exc)
+                drainer_exc.append(exc)
+
+        try:
+            io_pool = ThreadPoolExecutor(max_workers=self.cfg.verify_workers,
+                                         thread_name_prefix="ornix-io")
+            net_pool = ThreadPoolExecutor(max_workers=min(self.cfg.file_workers,
+                                                          HARD_MAX_FILE_WORKERS),
+                                          thread_name_prefix="ornix-net")
+            drainer = threading.Thread(target=_drain, name="ornix-drain",
+                                       daemon=True)
+            drainer.start()
+            try:
+                for item in pending:
+                    if self._abort is not None:
+                        break
+                    self._check_disk(item.size)
+                    self._budget.acquire(item.size)  # never submit-all (T3)
+                    net_pool.submit(net_job, item)
+            finally:
+                # net stage closed: no more io submissions after this point
+                net_pool.shutdown(wait=True)
+                io_pool.shutdown(wait=True)
+                with self._io_lock:
+                    self._io_open = False
+                drainer.join(timeout=3600)
         except KeyboardInterrupt:
             self._set_abort(KeyboardInterrupt())
             raise
@@ -799,6 +827,10 @@ class HfBatchDownloader:
                 except Exception:
                     pass
 
+        if drainer_exc:
+            # A failing handoff observer propagates raw (as when the drain ran
+            # on the calling thread); abort mapping below is for stage faults.
+            raise drainer_exc[0]
         if self._abort is not None:
             exc = self._abort
             if isinstance(exc, (PermanentDownloadError, DiskFullError,
