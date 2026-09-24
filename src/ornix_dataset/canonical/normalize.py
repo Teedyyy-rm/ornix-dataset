@@ -72,6 +72,8 @@ def _validate_sample(sample: SampleInput,
         return f"RIGHT_NOT_PERMITTED:{sample.rights_status}"
     if require_redistributable and not sample.redistribution_permitted:
         return "REDISTRIBUTION_FLAG_FALSE"
+    if sample.split not in layout.SPLITS:
+        return f"UNKNOWN_SPLIT:{sample.split}"
     if not sample.transcript_verified or not (sample.text or "").strip():
         return "TRANSCRIPT_UNVERIFIED"
     if not sample.language_verified:
@@ -163,13 +165,9 @@ def normalize_samples(samples: List[SampleInput], dataset_dir: str,
 
             dst = layout.audio_abs_path(dataset_dir, sample.split, row)
             existed = os.path.exists(dst)
-            conflict = _place_audio(sample, dst)
-            if conflict:
-                blocked.append(_blocker(sample, conflict))
-                continue
-            if existed:
-                n_reused_files += 1
-
+            # Persist the stable identity + speaker + provenance BEFORE any byte
+            # is written or published: a crash after this point cannot orphan an
+            # output file or allocate a second id on resume (spec §4/§7).
             state.set_provenance(ornix_id, {
                 "internal_key": key, "source_id": sample.source_id,
                 "source_uri": sample.source_uri, "source_revision": sample.source_revision,
@@ -183,6 +181,14 @@ def normalize_samples(samples: List[SampleInput], dataset_dir: str,
                 "transcript": sample.text, "language": row.language,
                 "speaker": speaker, "split": sample.split,
                 "source_speaker_ref": sample.speaker_ref})
+            state.commit()
+            conflict = _place_audio(sample, dst)
+            if conflict:
+                blocked.append(_blocker(sample, conflict))
+                continue
+            if existed:
+                n_reused_files += 1
+
             rows_by_split.setdefault(sample.split, []).append(row)
             licenses.add(sample.source_license)
             statuses.add(sample.rights_status)

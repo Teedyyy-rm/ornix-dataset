@@ -23,8 +23,17 @@ def finalize_dataset(dataset_dir: str, rights: Optional[Dict[str, Any]] = None,
                      changelog: str = "") -> Dict[str, Any]:
     """(Re)write card + checksum manifest + READY marker from current rows."""
     stats = layout.split_stats(dataset_dir)
-    rights = rights or {"licenses": [], "rights_status": [],
-                        "note": "rights supplied at export time"}
+    if rights is None:
+        # preserve the rights summary recorded at export time rather than wiping
+        # the card's license/attribution section on a bare re-finalize.
+        ready = os.path.join(dataset_dir, "RELEASE_READY.json")
+        rights = {}
+        if os.path.exists(ready):
+            try:
+                from ..util.io import read_json
+                rights = (read_json(ready) or {}).get("rights", {}) or {}
+            except Exception:
+                rights = {}
     if stats["n_rows"] == 0:
         return {"ok": False, "reason": "no-rows"}
     card.write_card(dataset_dir, stats, rights, changelog)

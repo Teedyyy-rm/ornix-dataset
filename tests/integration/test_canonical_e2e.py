@@ -281,3 +281,77 @@ def test_canonical_cli_export_verify_load_publish(tmp_path, sources_config, caps
     assert main(["canonical", "export-batch", "--root", str(tmp_path / "nope"),
                  "--job", "j", "--batch", "b", "--dataset", ds,
                  "--state", state]) == 2
+
+
+def test_incremental_upload_keeps_previous_batch_files_and_metadata(
+        tmp_path, monkeypatch):
+    hub = FakeHub()
+    wire_hub(monkeypatch, hub)
+    store = CampaignStore(str(tmp_path / "c"))
+    _, out = store.create_campaign("pub", [{"repo": f"org/A@{SHA}"}],
+                                   resolver=lambda r, v: SHA)
+    jid = out[0]["job_id"]
+    ds, state = tmp_path / "Ornix-Datasets", tmp_path / "state"
+
+    b1 = _campaign_batch(store, jid, "one.wav",
+                         _real_wav_bytes(tmp_path, "one.wav", 1),
+                         "câu một", "spk-A", "train", "1")
+    export_campaign_batch(store, jid, b1.batch_id, str(ds), str(state))
+    finalize_dataset(str(ds))
+    ap1 = tmp_path / "a1.yaml"
+    ap1.write_text(yaml.safe_dump(approval_for(str(ds), "main", repo_id="org/dest")),
+                   encoding="utf-8")
+    assert publish_dataset(str(ds), "org/dest", str(ap1),
+                           staging_revision="main")["ok"]
+
+    b2 = _campaign_batch(store, jid, "two.wav",
+                         _real_wav_bytes(tmp_path, "two.wav", 2),
+                         "câu hai", "spk-B", "train", "2")
+    export_campaign_batch(store, jid, b2.batch_id, str(ds), str(state))
+    finalize_dataset(str(ds))
+    ap2 = tmp_path / "a2.yaml"
+    ap2.write_text(yaml.safe_dump(approval_for(str(ds), "main", repo_id="org/dest")),
+                   encoding="utf-8")
+    assert publish_dataset(str(ds), "org/dest", str(ap2),
+                           staging_revision="main")["ok"]
+
+    remote_rows = [json.loads(l) for l in
+                   hub.remote["train/metadata.jsonl"].decode("utf-8").splitlines()]
+    assert len(remote_rows) == 2  # batch 1's row survived the batch 2 upload
+    texts = sorted(r["text"] for r in remote_rows)
+    assert texts == ["câu hai", "câu một"]
+    remote_wavs = {k for k in hub.remote if k.startswith("train/audio/")}
+    assert len(remote_wavs) == 2
+
+
+def test_canonical_loader_vs_hf_audiofolder(tmp_path):
+    """Canonical loader keeps 6 str/float fields; AudioFolder does not.
+
+    The AudioFolder assertion only runs when `datasets` is installed, so we never
+    *claim* its behavior without an actual check (task §9).
+    """
+    from ornix_dataset.canonical import SampleInput, normalize_samples
+    from ornix_dataset.canonical.loader import load_ornix_dataset
+
+    wav = tmp_path / "s.wav"
+    synth.write_wav(str(wav), synth.speechlike(24000, 2.0, seed=7), 24000)
+    s = SampleInput(wav_path=str(wav), text="kiểm tra", language="vi",
+                    speaker_ref="spk-1", source_scope="org/A@r", source_id="S",
+                    source_sha256="a" * 64, seg_start=0, seg_end=48000,
+                    split="train", rights_status="REDISTRIBUTION_APPROVED",
+                    redistribution_permitted=True, transcript_verified=True,
+                    language_verified=True,
+                    audio_sha256=sha256_file(str(wav)))
+    ds = tmp_path / "ds"
+    normalize_samples([s], str(ds), str(tmp_path / "st"))
+    row = load_ornix_dataset(str(ds))[0]
+    assert isinstance(row["audio"], str) and isinstance(row["file_name"], str)
+
+    datasets = pytest.importorskip("datasets")
+    try:
+        dd = datasets.load_dataset("audiofolder", data_dir=str(ds))
+    except Exception as exc:  # builder/decoder not provisioned
+        pytest.skip(f"audiofolder unavailable: {exc}")
+    feat = dd["train"].features
+    assert "file_name" in feat
+    assert feat["audio"].__class__.__name__ == "Audio"  # cast, not str

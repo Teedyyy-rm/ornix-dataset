@@ -284,3 +284,26 @@ def test_internal_key_is_stable_and_name_free():
     assert internal_sample_key("SRC_1", "a" * 64, 0, 48000, "rev1") == k
     assert "a.wav" not in k
     assert k != internal_sample_key("SRC_1", "a" * 64, 0, 48001, "rev1")
+
+
+def test_unknown_split_rejected_fail_closed(tmp_path):
+    bad = make_sample(tmp_path, name="dev.wav", split="dev", ssha="a" * 64)
+    rep = normalize(tmp_path, [bad])
+    assert rep["n_rows"] == 0
+    assert rep["blocked"][0]["reason"] == "UNKNOWN_SPLIT:dev"
+    assert not os.path.exists(str(tmp_path / "ds" / "dev"))
+
+
+def test_resume_recreates_missing_file_without_new_id(tmp_path):
+    # identity is committed before bytes: dropping the output must not allocate a
+    # second id on the next run (crash/resume safety)
+    s = make_sample(tmp_path, seed=11)
+    normalize(tmp_path, [s])
+    row = load_ornix_dataset(str(tmp_path / "ds"))[0]
+    wav = tmp_path / "ds" / "train" / row["audio"]
+    os.remove(str(wav))
+    normalize(tmp_path, [s])
+    rows = load_ornix_dataset(str(tmp_path / "ds"))
+    assert len(rows) == 1 and rows[0]["audio"] == row["audio"]
+    assert os.path.exists(str(tmp_path / "ds" / "train" / rows[0]["audio"]))
+    assert verify_canonical_dataset(str(tmp_path / "ds")).ok

@@ -94,20 +94,39 @@ Therefore the canonical loader reads `metadata.jsonl` directly
 `loader.load_with_datasets` is an explicit adapter and documents the cast. No
 claim is made that `AudioFolder` returns the six fields unchanged.
 
-## 7. Tests
+## 7. Shard-format research (Parquet / WebDataset)
 
-`tests/unit/test_canonical.py` (T1–T15) and
-`tests/integration/test_canonical_e2e.py` (T5/T6/T16/T17/T18) cover: exact six
-fields and types; `ornix_<32hex>.wav` naming; no source name in output; two
-datasets with the same filename; retry/resume stability; out-of-order workers
+Per the official docs, both alternatives exist but are not needed for the MVP:
+
+- **Parquet**: audio can be embedded as bytes and `datasets`/pandas can write it
+  (`dataset.to_parquet`, column type `Audio()`). This changes the *storage
+  representation*: the canonical contract `audio: str`/`file_name: str` would
+  become a decoded `Audio` feature, so any Parquet path must keep the canonical
+  metadata separate from the storage encoding and be proven loader-compatible
+  before use.
+- **WebDataset**: per-example `.wav`+`.json` inside TAR shards
+  (`folder/train/00000.tar`), suited to very large corpora.
+
+Decision: keep **WAV + `metadata.jsonl`** (with `audio`/`file_name` as strings)
+in the MVP; `dataset_dir` shards audio by id prefix. Revisit Parquet/TAR only
+when file count makes it necessary, and then require a verified loader.
+
+## 8. Tests
+
+`tests/unit/test_canonical.py` (T1–T15 + resume/unknown-split) and
+`tests/integration/test_canonical_e2e.py` (T5/T6/T16/T17/T18 + incremental
+upload) cover: exact six fields and types; `ornix_<32hex>.wav` naming; no source
+name in output; two datasets with the same filename; retry/resume stability
+(including recreating a dropped output with the *same* id); out-of-order workers
 without duplicates; stable speaker mapping and no false merge; duration equals
 the verified WAV; unverified transcript/language exclusion; `audio == file_name`
 with every path present; no orphan/dangling/duplicate rows; preserved leakage-
 safe splits; Unicode + float JSONL; internal provenance preserved; rights not
-bypassed by renaming; real-WAV loader readback; incremental export; remote
-verification failure blocking cleanup; and the full existing regression suite.
+bypassed by renaming; real-WAV loader readback; incremental export **and**
+incremental upload; remote verification failure blocking cleanup; unknown split
+rejected; and the full existing regression suite.
 
-## 8. Known limitations / not claimed
+## 9. Known limitations / not claimed
 
 - No live HF upload is performed or claimed here (`REMOTE_UPLOAD_UNVERIFIED`):
   the publish path is exercised against the in-memory `FakeHub` only.
