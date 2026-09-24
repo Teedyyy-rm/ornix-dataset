@@ -1,7 +1,5 @@
 """MD-003 Gate 3 — DOWNLOAD_VERIFIED (adapter level, all offline)."""
 
-import hashlib
-import json
 import os
 import threading
 from types import SimpleNamespace
@@ -19,49 +17,10 @@ from ornix_dataset.campaign import (
     run_batch,
 )
 from ornix_dataset.ingestion.hf_downloader import DownloadConfig
+from ornix_dataset.testing.fakes import FakeNet
 
 SHA = "d" * 40
 GB = 1024**3
-
-
-class FakeNet:
-    """Mock transport: __call__(path, force=False) -> local file with payload."""
-
-    def __init__(self, tmp):
-        self.dir = os.path.join(str(tmp), "net")
-        os.makedirs(self.dir, exist_ok=True)
-        self.payload = {}
-        self.calls = []
-        self.errors = {}
-        self.lock = threading.Lock()
-        self.barrier = None
-        self.peak = 0
-        self.active = 0
-
-    def add(self, path, data):
-        self.payload[path] = data
-
-    def sha(self, path):
-        return hashlib.sha256(self.payload[path]).hexdigest()
-
-    def __call__(self, path, force=False):
-        with self.lock:
-            self.calls.append(path)
-            self.active += 1
-            self.peak = max(self.peak, self.active)
-        try:
-            if self.barrier is not None:
-                self.barrier.wait(timeout=15)
-            errs = self.errors.get(path, [])
-            if errs:
-                raise errs.pop(0)()
-            p = os.path.join(self.dir, path.replace("/", "_"))
-            with open(p, "wb") as fh:
-                fh.write(self.payload[path])
-            return p
-        finally:
-            with self.lock:
-                self.active -= 1
 
 
 def make_store(tmp, files, resolver=None, **budget_kw):

@@ -23,9 +23,14 @@ from ornix_dataset.campaign import (
 )
 from ornix_dataset.campaign.processing import qc_paths
 from ornix_dataset.ingestion.hf_downloader import DownloadConfig
-from test_downloading import FakeNet
-from test_processing import FakeAnalyzer
-from test_publish_campaign import FakeHub, approval_for, wire_hub
+from ornix_dataset.testing.fakes import (
+    FakeAnalyzer,
+    FakeHub,
+    FakeNet,
+    approval_for,
+    wire_hub,
+)
+from test_publish_campaign import ready_batch
 
 SHA = "g" * 40
 GB = 1024**3

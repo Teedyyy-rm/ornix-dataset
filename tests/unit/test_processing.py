@@ -1,11 +1,7 @@
 """MD-004 Gate 4 — PROCESSING_VERIFIED (fake analyzer + mock transport)."""
 
-import hashlib
-import json
 import os
 import threading
-import time
-from types import SimpleNamespace
 
 from ornix_dataset.campaign import (
     Budget,
@@ -18,64 +14,11 @@ from ornix_dataset.campaign import (
     run_qc_batch,
 )
 from ornix_dataset.ingestion.hf_downloader import DownloadConfig
+from ornix_dataset.testing.fakes import FakeAnalyzer, FakeNet
 from ornix_dataset.util.jsonl import append_jsonl, load_jsonl
 
 SHA = "e" * 40
 GB = 1024**3
-
-
-class FakeNet:
-    def __init__(self, tmp):
-        self.dir = os.path.join(str(tmp), "net")
-        os.makedirs(self.dir, exist_ok=True)
-        self.payload = {}
-        self.calls = []
-        self.lock = threading.Lock()
-        self.delay = 0.0
-
-    def add(self, path, data):
-        self.payload[path] = data
-
-    def sha(self, path):
-        return hashlib.sha256(self.payload[path]).hexdigest()
-
-    def __call__(self, path, force=False):
-        with self.lock:
-            self.calls.append(path)
-        if self.delay:
-            time.sleep(self.delay)
-        p = os.path.join(self.dir, path.replace("/", "_"))
-        with open(p, "wb") as fh:
-            fh.write(self.payload[path])
-        return p
-
-
-class FakeAnalyzer:
-    """Mirrors the real contract: appends its own evidence, returns outcomes."""
-
-    def __init__(self, delay=0, fail_on=(), speaker_mod=2):
-        self.delay = delay
-        self.fail_on = set(fail_on)
-        self.speaker_mod = speaker_mod
-        self.seen = []
-
-    def __call__(self, src, paths, audit):
-        if self.delay:
-            time.sleep(self.delay)
-        self.seen.append(src.source_id)
-        if src.original_file_id in self.fail_on:
-            raise RuntimeError("bad clip")
-        append_jsonl(paths.evidence, {
-            "source_id": src.source_id, "decision": "ACCEPT"})
-        i = len(self.seen)
-        row = {"audio_id": src.original_file_id,
-               "source_id": src.source_id,
-               "speaker_id": f"spk-{i % self.speaker_mod}",
-               "source_sha256": src.source_sha256,
-               "audio_sha256": src.source_sha256}
-        return SimpleNamespace(evidences=[{"source_id": src.source_id}],
-                               accepted=[SimpleNamespace(
-                                   to_dict=lambda r=row: dict(r))])
 
 
 def downloaded_store(tmp, batches_files, payload_size=2048):

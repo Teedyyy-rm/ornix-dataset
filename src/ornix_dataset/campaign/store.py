@@ -237,6 +237,17 @@ class CampaignStore:
             if b.checkpoint_rel != os.path.join(
                     "checkpoints", b.job_id, f"{b.batch_id}.jsonl"):
                 raise AssertionError("checkpoint path convention violated")
+            # Re-planning is reproducible AND progress-preserving: the same
+            # batch_id means the same file set, so a batch that already did
+            # work keeps its status/result/checkpoint (a crash + re-plan must
+            # never roll completed work back to PLANNED).
+            try:
+                old = self.load_batch(b.batch_id)
+                if old.job_id == b.job_id and old.files == b.files:
+                    b.status = old.status
+                    b.result = old.result
+            except FileNotFoundError:
+                pass
             self.save_batch(b)
         job.batch_ids = [b.batch_id for b in batches]
         job.status = JobStatus.BATCHED.value

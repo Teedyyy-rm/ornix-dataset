@@ -1,6 +1,5 @@
 """MD-005 Gate 5 — PUBLISH_VERIFIED (FakeHub, all offline)."""
 
-import hashlib
 import json
 import os
 
@@ -18,78 +17,16 @@ from ornix_dataset.campaign import (
 )
 from ornix_dataset.campaign.processing import qc_paths
 from ornix_dataset.publishing.hf import marker_path_for
+from ornix_dataset.testing.fakes import (
+    FakeHub,
+    accepted_row,
+    approval_for,
+    wire_hub,
+)
 from ornix_dataset.util.jsonl import load_jsonl
 
 SHA = "f" * 40
 GB = 1024**3
-
-
-class FakeHub:
-    """In-memory Hub: remote path -> bytes, with scripted upload failures."""
-
-    def __init__(self):
-        self.remote = {}
-        self.upload_failures = []
-        self.upload_calls = 0
-        self.branches = []
-
-    # -- publisher surface --
-    def repo_info(self, repo_id, repo_type="dataset"):
-        return {"id": repo_id}
-
-    def create_branch(self, repo_id, branch, repo_type="dataset", exist_ok=True):
-        self.branches.append(branch)
-
-    def upload_folder(self, folder_path, repo_id, repo_type="dataset",
-                      revision=None, path_in_repo=None, commit_message=""):
-        self.upload_calls += 1
-        if self.upload_failures:
-            raise self.upload_failures.pop(0)
-        for dp, _ds, fs in os.walk(folder_path):
-            for f in fs:
-                full = os.path.join(dp, f)
-                rel = os.path.relpath(full, folder_path)
-                key = f"{path_in_repo}/{rel}" if path_in_repo else rel
-                with open(full, "rb") as fh:
-                    self.remote[key] = fh.read()
-
-        class _Commit:
-            oid = "c" * 40
-        return _Commit()
-
-    def list_repo_files(self, repo_id, repo_type="dataset", revision=None):
-        return list(self.remote)
-
-
-def fake_download_factory(hub):
-    def _dl(repo_id, filename, repo_type="dataset", revision=None):
-        p = f"/tmp/fakehub-{abs(hash(filename)) % 999999}.bin"
-        with open(p, "wb") as fh:
-            fh.write(hub.remote[filename])
-        return p
-    return _dl
-
-
-def wire_hub(monkeypatch, hub):
-    import huggingface_hub
-    monkeypatch.setattr(huggingface_hub, "HfApi", lambda token=None: hub)
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download",
-                        fake_download_factory(hub))
-    monkeypatch.setenv("HF_TOKEN", "dummy")
-
-
-def accepted_row(audio_id, audio_bytes, release_id="R"):
-    sha = hashlib.sha256(audio_bytes).hexdigest()
-    return {"audio_id": audio_id, "audio": audio_id, "language": "vi",
-            "speaker_id": "spk-0", "transcript": "x",
-            "sample_rate": 24000, "channels": 1, "encoding": "PCM_S16LE",
-            "duration_s": 3.0, "source_id": "SRC_" + sha[:16],
-            "source_sha256": sha, "audio_sha256": sha,
-            "segment_start_sample_source": 0,
-            "segment_end_sample_source": 72000,
-            "rights_record_id": "rr", "quality_evidence_id": "qe",
-            "quality_policy_version": "v1", "quality_gate": "ACCEPT",
-            "split": "train", "release_id": release_id}
 
 
 def ready_batch(tmp_path, name="a.wav", n_extra_shards=0):
@@ -118,16 +55,6 @@ def ready_batch(tmp_path, name="a.wav", n_extra_shards=0):
     batch.status = "RELEASE_READY"
     store.save_batch(batch)
     return store, jid, batch
-
-
-def approval_for(release_dir, revision, repo_id="org/dest"):
-    from ornix_dataset.publishing.approval import release_digest
-
-    return {"release_digest": release_digest(release_dir),
-            "repo_id": repo_id, "revision": revision,
-            "max_bytes": 10**12, "operator_id": "op",
-            "expires_utc": "2999-01-01T00:00:00Z",
-            "policy_version": "v1", "license_ack": True}
 
 
 def test_prepare_refuses_unready_batch(tmp_path):

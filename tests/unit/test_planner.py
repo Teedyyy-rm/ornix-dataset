@@ -171,6 +171,22 @@ def test_budget_from_real_disk_and_fail_closed(tmp_path):
 
 # -- store + CLI integration -------------------------------------------------------
 
+def test_replan_preserves_completed_progress(tmp_path):
+    store = CampaignStore(str(tmp_path / "c"))
+    _, out = store.create_campaign(
+        "demo", [{"repo": f"org/A@{SHA}"}],
+        resolver=lambda r, v: SHA)
+    jid = out[0]["job_id"]
+    budget = small_budget()
+    (b,) = store.plan_job_batches(jid, [("a.wav", 100)], budget=budget)
+    b.status = "IN_PROGRESS"
+    b.result = {"download": {"complete": True}}
+    store.save_batch(b)
+    (b2,) = store.plan_job_batches(jid, [("a.wav", 100)], budget=budget)
+    assert b2.batch_id == b.batch_id
+    assert b2.status == "IN_PROGRESS" and b2.result["download"]["complete"]
+
+
 def test_store_budgeted_plan_persists_reservations(tmp_path):
     store = CampaignStore(str(tmp_path / "c"))
     _, out = store.create_campaign(
