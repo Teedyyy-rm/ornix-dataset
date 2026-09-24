@@ -277,6 +277,20 @@ def cmd_run(args):
         env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"  # faster bulk shard downloads
     except Exception:
         pass
+    # Make GPU (CUDAExecutionProvider) usable when CUDA libs come from pip wheels
+    # (nvidia-*-cu12): add their lib dirs to LD_LIBRARY_PATH so onnxruntime-gpu can
+    # load libcublas/libcudnn/etc. Harmless on CPU-only boxes (no nvidia package).
+    try:
+        import glob
+        import nvidia
+        base = os.path.dirname(nvidia.__file__)
+        libdirs = sorted({os.path.dirname(p)
+                          for p in glob.glob(os.path.join(base, "*", "lib", "*.so*"))})
+        if libdirs:
+            existing = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = os.pathsep.join(libdirs + ([existing] if existing else []))
+    except Exception:
+        pass
     ckpt = load_ckpt(args.state)
     datasets = man["datasets"]
     if args.only:
