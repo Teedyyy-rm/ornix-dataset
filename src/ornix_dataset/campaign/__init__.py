@@ -16,6 +16,15 @@ from .downloading import (
     read_manifest,
     run_batch,
 )
+from .processing import (
+    gate_batch_release,
+    gate_receipt_path,
+    manifest_to_source_record,
+    qc_done_files,
+    qc_paths,
+    qc_run_id,
+    run_qc_batch,
+)
 from .planning import plan_batches
 from .refs import (
     canonical_repo_id,
@@ -56,13 +65,20 @@ __all__ = [
     "default_resolver",
     "downloaded_files",
     "fetch_job_inventory",
+    "gate_batch_release",
+    "gate_receipt_path",
     "is_full_sha",
     "manifest_path",
+    "manifest_to_source_record",
     "normalize_repo_ref",
     "pin_revision",
     "plan_batches",
     "plan_with_budget",
+    "qc_done_files",
+    "qc_paths",
+    "qc_run_id",
     "read_manifest",
     "run_batch",
+    "run_qc_batch",
     "try_admit",
 ]
