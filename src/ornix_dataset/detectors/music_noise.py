@@ -81,21 +81,91 @@ def _mask(intervals: List[List[float]]):
 
 @registry.register(DetectorKind.NOISE, "panns")
 class PannsMusicDetector(NoiseDetector):
-    """PANNs sound-event tagging (music gate candidate). UNAVAILABLE until a
-    checksum-pinned checkpoint is provisioned; never fabricates timestamps."""
+    """PANNs sound-event tagging (music gate). Uses framewise SED to emit
+    ``MUSIC_BACKGROUND`` intervals. UNAVAILABLE until a checksum-pinned checkpoint
+    is provisioned; never fabricates timestamps."""
 
-    def __init__(self, model_path: Optional[str] = None, weights_sha256: Optional[str] = None):
+    _SR = 32000  # PANNs models are trained at 32 kHz
+
+    def __init__(self, model_path: Optional[str] = None, weights_sha256: Optional[str] = None,
+                 music_threshold: float = 0.2, min_event_s: float = 0.3):
         self.model_path = model_path
         self.weights_sha256 = weights_sha256
-        self._reason = "model_path not provided or missing" if not (
-            model_path and os.path.exists(model_path)) else None
+        self.music_threshold = music_threshold
+        self.min_event_s = min_event_s
+        self._sed = None
+        self._music_idx: Optional[List[int]] = None
+        self._reason: Optional[str] = None
+        self._try_load()
+
+    def _try_load(self) -> None:
+        if not (self.model_path and os.path.exists(self.model_path)):
+            self._reason = "model_path not provided or missing"
+            return
+        try:
+            from ..util.hashing import sha256_file
+            if self.weights_sha256 and sha256_file(self.model_path) != self.weights_sha256:
+                self._reason = "weights sha256 mismatch"
+                return
+            from panns_inference import SoundEventDetection, labels
+            self._sed = SoundEventDetection(checkpoint_path=self.model_path, device="cpu")
+            music = {"Music", "Musical instrument", "Singing"}
+            self._music_idx = [i for i, l in enumerate(labels) if l in music]
+            if not self._music_idx:
+                self._reason = "AudioSet 'Music' class not found in model labels"
+                self._sed = None
+        except Exception as e:  # pragma: no cover - depends on runtime/weights
+            self._reason = f"panns_inference/weights unavailable: {e}"
+            self._sed = None
 
     def info(self) -> AdapterInfo:
         if self._reason:
             return AdapterInfo("panns", DetectorKind.NOISE, Availability.UNAVAILABLE,
-                               model_id="panns-cnn14", reason=self._reason)
+                               model_id="panns-cnn14", detects_music=True, reason=self._reason)
         return AdapterInfo("panns", DetectorKind.NOISE, Availability.AVAILABLE,
-                           model_id="panns-cnn14", weights_sha256=self.weights_sha256)
+                           model_id="panns-cnn14", weights_sha256=self.weights_sha256,
+                           detects_music=True, license="Apache-2.0")
 
-    def infer(self, mono, sr, speech_intervals):  # pragma: no cover
-        raise RuntimeError(f"PANNs unavailable: {self._reason}")
+    def infer(self, mono, sr, speech_intervals):
+        if self._sed is None:
+            raise RuntimeError(f"PANNs unavailable: {self._reason}")
+        import numpy as _np
+
+        audio = _resample_to(mono, sr, self._SR)
+        framewise = self._sed.inference(audio[None, :])[0]  # (n_frames, 527)
+        music = framewise[:, self._music_idx].max(axis=1)
+        n = len(music)
+        dur = len(audio) / self._SR
+        hop_s = dur / max(1, n)
+        speech = _mask(speech_intervals)
+        events: List[NoiseEvent] = []
+        run_start: Optional[int] = None
+        for i in range(n + 1):
+            active = i < n and music[i] >= self.music_threshold
+            if active and run_start is None:
+                run_start = i
+            elif not active and run_start is not None:
+                s, e = run_start * hop_s, i * hop_s
+                if e - s >= self.min_event_s:
+                    score = float(music[run_start:i].mean())
+                    sev = Severity.N2 if speech(s, e) else Severity.N1
+                    events.append(NoiseEvent(NoiseLabel.MUSIC_BACKGROUND, round(s, 3),
+                                             round(e, 3), speech(s, e), sev, score, score,
+                                             "panns-sed", "panns-cnn14"))
+                run_start = None
+        return events
+
+
+def _resample_to(mono, sr: int, target: int):
+    import numpy as _np
+    if sr == target:
+        return mono.astype(_np.float32)
+    try:
+        from scipy.signal import resample_poly
+        from math import gcd
+        g = gcd(sr, target)
+        return resample_poly(mono, target // g, sr // g).astype(_np.float32)
+    except Exception:  # pragma: no cover - scipy always present in dsp extra
+        n = int(round(len(mono) * target / sr))
+        idx = _np.linspace(0, len(mono) - 1, n)
+        return _np.interp(idx, _np.arange(len(mono)), mono).astype(_np.float32)

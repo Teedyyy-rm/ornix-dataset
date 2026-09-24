@@ -24,27 +24,45 @@ class RemoteVerifyResult:
                 "n_remote_files": self.n_remote_files, "checked_samples": self.checked_samples}
 
 
+# HF creates/keeps these repo-internal files; they are not part of our MANIFEST.
+_REMOTE_IGNORE = {".gitattributes"}
+
+
 def remote_verify(api: Any, repo_id: str, revision: str, release_dir: str,
-                  sample: int = 3) -> RemoteVerifyResult:  # pragma: no cover - network
+                  sample: int = 3, full_hash: bool = False,
+                  ignore: set | None = None) -> RemoteVerifyResult:  # pragma: no cover - network
+    """Verify the remote tree at ``revision`` byte-for-byte against the local release.
+
+    Uses an EXACT set comparison (not subset): a remote file that is not in the
+    local release — a stale shard from a previous push, a stray upload — is a
+    failure, because a consumer would receive bytes we never validated. With
+    ``full_hash`` every file is re-downloaded and hashed; otherwise a deterministic
+    sample is checked.
+    """
+    ignore = _REMOTE_IGNORE if ignore is None else ignore
     errors: List[str] = []
     try:
         remote_files = set(api.list_repo_files(repo_id, repo_type="dataset", revision=revision))
     except Exception as e:
         return RemoteVerifyResult(False, [f"list_repo_files failed: {e}"])
+    remote_files = {f for f in remote_files if f not in ignore}
 
     local_files = []
     for dp, _d, fs in os.walk(release_dir):
         for f in fs:
             local_files.append(os.path.relpath(os.path.join(dp, f), release_dir))
-    for rel in local_files:
-        if rel not in remote_files:
-            errors.append(f"REMOTE_MISSING:{rel}")
+    local_set = set(local_files)
+    for rel in sorted(local_set - remote_files):
+        errors.append(f"REMOTE_MISSING:{rel}")
+    for rel in sorted(remote_files - local_set):
+        errors.append(f"EXTRA_REMOTE_FILE:{rel}")
 
     from huggingface_hub import hf_hub_download
     from ..util.hashing import sha256_file
 
+    to_check = sorted(local_files) if full_hash else sorted(local_files)[:sample]
     checked = 0
-    for rel in sorted(local_files)[:sample]:
+    for rel in to_check:
         try:
             got = hf_hub_download(repo_id, rel, repo_type="dataset", revision=revision)
             if sha256_file(got) != sha256_file(os.path.join(release_dir, rel)):

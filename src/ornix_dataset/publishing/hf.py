@@ -66,7 +66,8 @@ class StagedPublisher:
                                  reasons=["dry-run default; no remote mutation"], plan=plan)
 
         receipt = load_approval(approval_path)
-        ok, reasons = validate_approval(receipt, release_dir, repo_id)
+        ok, reasons = validate_approval(receipt, release_dir, repo_id,
+                                        revision=staging_revision)
         if not ok:
             return PublishResult(PublishStatus.BLOCKED, repo_id, reasons=reasons, plan=plan)
 

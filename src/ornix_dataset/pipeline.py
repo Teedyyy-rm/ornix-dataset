@@ -20,7 +20,7 @@ from .contracts.quality import NoiseEvent, QualityEvidence
 from .contracts.release import ReleaseRow
 from .contracts.source import SourceRecord
 from .curation.policy import PolicyConfig, PolicyEngine
-from .curation.segmentation import plan_segments
+from .curation.segmentation import low_energy_points, plan_segments
 from .curation.transcript import transcript_match_status
 from .detectors import DetectorKind, registry
 from .detectors.windowing import intersect_intervals, total_duration
@@ -69,19 +69,45 @@ class AnalyzeResult:
 class OrnixPipeline:
     def __init__(self, workdir: str, policy: PolicyConfig,
                  vad_name: str = "energy", noise_name: str = "dsp",
-                 tech: Optional[TechnicalThresholds] = None):
+                 tech: Optional[TechnicalThresholds] = None,
+                 detectors: Optional[Any] = None):
         self.workdir = workdir
         self.policy = policy
         self.engine = PolicyEngine(policy)
-        self.vad = registry.create(DetectorKind.VAD, vad_name)
-        self.noise = registry.create(DetectorKind.NOISE, noise_name)
         self.tech = tech or TechnicalThresholds()
-        self.availability = {"music": False, "quality": False, "speaker": False}
+        if detectors is not None:
+            self.vad = detectors.vad
+            self.noise = detectors.noise
+            self.music = detectors.music
+            self.quality = detectors.quality
+            self.speaker = detectors.speaker
+            self.availability = dict(detectors.availability)
+        else:
+            self.vad = registry.create(DetectorKind.VAD, vad_name)
+            self.noise = registry.create(DetectorKind.NOISE, noise_name)
+            self.music = None
+            self.quality = registry.create(DetectorKind.QUALITY, "dnsmos")
+            self.speaker = registry.create(DetectorKind.SPEAKER, "pyannote")
+            self.availability = {
+                "music": bool(self.noise.info().detects_music and self.noise.available),
+                "quality": bool(self.quality.available),
+                "speaker": bool(self.speaker.available),
+            }
 
     def analyze_source(self, src: SourceRecord, paths: RunPaths,
                        audit: AuditLog) -> AnalyzeResult:
         result = AnalyzeResult()
-        if src.ingest_status != IngestStatus.INGESTED or not src.staged_path:
+        # quarantined / errored / not-yet-ingested sources are not analyzable, but a
+        # record that claims INGESTED with no staged bytes is a real fault, not a
+        # thing to silently drop — emit an ERROR evidence + audit event (no-loss).
+        if src.ingest_status != IngestStatus.INGESTED:
+            return result
+        if not src.staged_path or not os.path.exists(src.staged_path):
+            ev = self._error_evidence(src, "STAGED_PATH_MISSING")
+            append_jsonl(paths.evidence, ev.to_dict())
+            result.evidences.append(ev)
+            audit.emit("analyze_error", src.source_id, reason="STAGED_PATH_MISSING",
+                       staged_path=src.staged_path or "")
             return result
         report = run_technical_validation(src.staged_path, self.tech,
                                           declared_duration_s=src.source_duration_s)
@@ -105,21 +131,45 @@ class OrnixPipeline:
             policy_version=self.policy.policy_version, timestamp_utc=utc_now_iso(),
         )
 
+    def _error_evidence(self, src: SourceRecord, reason: str) -> QualityEvidence:
+        return QualityEvidence(
+            segment_id="SEG_" + short_id(src.source_sha256, "error", reason),
+            source_sha256=src.source_sha256, interval_start_sample=0,
+            interval_end_sample=0, analysis_sample_rate=16000,
+            decision=DecisionState.ERROR, reason_codes=[reason],
+            policy_version=self.policy.policy_version, timestamp_utc=utc_now_iso(),
+        )
+
+    def _detect_noise(self, samples, sr, speech_intervals) -> List[NoiseEvent]:
+        """DSP noise (always) + optional music-gate detector, merged."""
+        events = list(self.noise.infer(samples, sr, speech_intervals))
+        if self.music is not None and self.music.available:
+            events.extend(self.music.infer(samples, sr, speech_intervals))
+        return events
+
     def _analyze_segments(self, src, buf: AudioBuffer, paths, audit, result) -> None:
         sr = buf.sample_rate
         speech = self.vad.infer(buf.samples, sr)
-        events = self.noise.infer(buf.samples, sr, speech)
+        events = self._detect_noise(buf.samples, sr, speech)
         exclude = [[e.start_s, e.end_s] for e in events
                    if e.severity.value in ("N3",) or e.label.value == "MUSIC_ONLY"]
+        # low-energy minima as candidate cut boundaries (never cut mid-syllable)
+        silence_points = low_energy_points(buf.samples, sr)
         plan = plan_segments(speech, exclude,
                              max_duration_s=self.tech.max_duration_s,
-                             min_duration_s=self.tech.min_duration_s)
+                             min_duration_s=self.tech.min_duration_s,
+                             silence_points=silence_points)
         if not plan.intervals_s:
             plan.intervals_s = [[0.0, min(buf.duration_s, self.tech.max_duration_s)]]
+        segmented = len(plan.intervals_s) > 1 or (
+            plan.intervals_s and total_duration(plan.intervals_s) < buf.duration_s - 0.2)
         for idx, (s, e) in enumerate(plan.intervals_s):
-            self._process_segment(src, buf, s, e, idx, speech, paths, audit, result)
+            uncertain = idx in getattr(plan, "uncertain_indices", set())
+            self._process_segment(src, buf, s, e, idx, speech, paths, audit, result,
+                                   segmented=segmented, boundary_uncertain=uncertain)
 
-    def _process_segment(self, src, buf, s, e, idx, speech, paths, audit, result) -> None:
+    def _process_segment(self, src, buf, s, e, idx, speech, paths, audit, result,
+                         segmented: bool = False, boundary_uncertain: bool = False) -> None:
         sr = buf.sample_rate
         a, b = int(s * sr), int(e * sr)
         seg = buf.samples[a:b]
@@ -133,7 +183,10 @@ class OrnixPipeline:
         except RuntimeError as exc:
             audit.emit("render_failed", seg_id, reason=str(exc))
             return
-        ev = self._build_evidence(src, seg_buf, seg_id, a, b, s, e, speech, recipe)
+        # a sub-segment cannot inherit the whole-source transcript verbatim
+        transcript_valid = not (segmented or boundary_uncertain)
+        ev = self._build_evidence(src, seg_buf, seg_id, a, b, s, e, speech, recipe,
+                                  transcript_valid=transcript_valid)
         decision = self.engine.decide(ev, src, self.availability)
         ev.decision = decision.decision
         ev.reason_codes = decision.reason_codes
@@ -144,19 +197,46 @@ class OrnixPipeline:
         audit.emit("decision", seg_id, decision=decision.decision.value,
                    reasons=decision.reason_codes)
         if decision.decision == DecisionState.ACCEPT:
-            row = self._release_row(src, ev, seg_id, out_wav, audio_sha, a, b, seg_buf)
+            row = self._release_row(src, ev, seg_id, out_wav, audio_sha, a, b, seg_buf,
+                                    transcript_valid=transcript_valid)
             append_jsonl(paths.accepted, row.to_dict())
             result.accepted.append(row)
 
-    def _build_evidence(self, src, seg_buf, seg_id, a, b, s, e, speech, recipe) -> QualityEvidence:
+    def _build_evidence(self, src, seg_buf, seg_id, a, b, s, e, speech, recipe,
+                        transcript_valid: bool = True) -> QualityEvidence:
         sr = seg_buf.sample_rate
         stats = signal_stats(seg_buf.samples)
         seg_speech = intersect_intervals(speech, [[s, e]])
         seg_dur = max(1e-9, e - s)
         speech_ratio = min(1.0, total_duration(seg_speech) / seg_dur)
-        seg_events = self.noise.infer(seg_buf.samples, sr, [[0.0, seg_dur]])
-        tstatus = transcript_match_status(
-            src.source_transcript, verified=bool(getattr(src, "_transcript_verified", False)))
+        seg_events = self._detect_noise(seg_buf.samples, sr, [[0.0, seg_dur]])
+        # transcript: only trust the source transcript for a whole-source clip
+        if transcript_valid:
+            tstatus = transcript_match_status(
+                src.source_transcript,
+                verified=bool(getattr(src, "_transcript_verified", False)))
+        else:
+            tstatus = MeasurementStatus.UNKNOWN  # needs forced alignment on the sub-segment
+
+        # real quality (DNSMOS) evidence when the adapter is available
+        sig = bak = ovrl = None
+        quality_status = MeasurementStatus.UNKNOWN
+        if self.quality is not None and self.quality.available:
+            q = self.quality.infer(seg_buf.samples, sr)
+            sig, bak, ovrl = q.get("sig"), q.get("bak"), q.get("ovrl")
+            quality_status = MeasurementStatus(q.get("status", "UNKNOWN"))
+
+        # real speaker/overlap (pyannote) evidence when available
+        speaker_overlap: List[List[float]] = []
+        if self.policy.single_speaker_required:
+            speaker_status = MeasurementStatus.UNKNOWN
+            if self.speaker is not None and self.speaker.available:
+                sp = self.speaker.infer(seg_buf.samples, sr)
+                speaker_overlap = sp.get("overlap_intervals", []) or []
+                speaker_status = MeasurementStatus(sp.get("status", "UNKNOWN"))
+        else:
+            speaker_status = MeasurementStatus.NOT_APPLICABLE
+
         proc_sha = sha256_json(recipe.to_dict())
         return QualityEvidence(
             segment_id=seg_id, source_sha256=src.source_sha256,
@@ -166,26 +246,33 @@ class OrnixPipeline:
             snr_status=MeasurementStatus.UNKNOWN,
             clipping_ratio=stats.clipping_ratio, max_clipped_run=stats.max_clipped_run,
             speech_ratio=round(speech_ratio, 4),
-            quality_status=MeasurementStatus.UNKNOWN,
-            speaker_status=(MeasurementStatus.UNKNOWN if self.policy.single_speaker_required
-                            else MeasurementStatus.NOT_APPLICABLE),
+            sig=sig, bak=bak, ovrl=ovrl,
+            quality_status=quality_status,
+            speaker_overlap_intervals=speaker_overlap,
+            speaker_status=speaker_status,
             transcript_match_status=tstatus, calibration_domain="UNKNOWN",
             policy_version=self.policy.policy_version, processing_sha256=proc_sha,
             timestamp_utc=utc_now_iso(),
         )
 
-    def _release_row(self, src, ev, seg_id, out_wav, audio_sha, a, b, seg_buf) -> ReleaseRow:
+    def _release_row(self, src, ev, seg_id, out_wav, audio_sha, a, b, seg_buf,
+                     transcript_valid: bool = True) -> ReleaseRow:
         audio_id = "ornix_" + (src.source_language or "vi") + "_" + short_id(audio_sha, length=12)
+        # never publish a whole-source transcript against a sub-segment
+        transcript = (src.source_transcript or "") if transcript_valid else ""
         return ReleaseRow(
             audio_id=audio_id, audio=f"audio/{seg_id}.wav",
             language=src.source_language or "vi",
             speaker_id=src.source_speaker_ref or ("anon_" + short_id(src.source_sha256, length=10)),
-            transcript=src.source_transcript or "",
+            transcript=transcript,
             sample_rate=24000, channels=1, encoding="PCM_S16LE",
             duration_s=round(seg_buf.duration_s, 6),
             source_id=src.source_id, source_sha256=src.source_sha256, audio_sha256=audio_sha,
             segment_start_sample_source=a, segment_end_sample_source=b,
             rights_record_id="RIGHTS_" + short_id(src.source_id, length=10),
+            source_license=src.source_license,
+            rights_status=src.rights_status.value,
+            redistribution_permitted=bool(src.redistribution_permitted),
             quality_evidence_id=seg_id, quality_policy_version=self.policy.policy_version,
             quality_gate="ACCEPT", split="train", release_id="pending",
         )
@@ -208,14 +295,24 @@ class OrnixPipeline:
                            duplicate_of=seen_sha[rec.source_sha256])
                 continue
             seen_sha[rec.source_sha256] = rec.source_id
-            if rec.ingest_status == IngestStatus.INGESTED and rec.source_uri.startswith("file://"):
-                src_path = rec.source_uri[len("file://"):]
-                ext = os.path.splitext(src_path)[1] or ".wav"
-                dst = os.path.join(staging, f"{rec.source_id}{ext}")
-                if not os.path.exists(dst):
-                    shutil.copyfile(src_path, dst)
-                    os.chmod(dst, 0o444)  # immutable staging
-                rec.staged_path = dst
+            if rec.ingest_status == IngestStatus.INGESTED:
+                if rec.source_uri.startswith("file://"):
+                    src_path = rec.source_uri[len("file://"):]
+                    ext = os.path.splitext(src_path)[1] or ".wav"
+                    dst = os.path.join(staging, f"{rec.source_id}{ext}")
+                    if not os.path.exists(dst):
+                        shutil.copyfile(src_path, dst)
+                        os.chmod(dst, 0o444)  # immutable staging
+                    rec.staged_path = dst
+                elif rec.source_uri.startswith("hf://") and hasattr(adapter, "materialize"):
+                    # download the pinned-commit blob, verify content sha, stage immutably
+                    try:
+                        adapter.materialize(rec, staging)
+                        audit.emit("materialize", rec.source_id, staged=bool(rec.staged_path))
+                    except Exception as exc:  # fail-closed: no hidden skip
+                        rec.ingest_status = IngestStatus.ERROR
+                        rec.reason_codes = list(rec.reason_codes) + [f"MATERIALIZE_FAILED:{exc}"]
+                        audit.emit("materialize_failed", rec.source_id, reason=str(exc))
             append_jsonl(paths.source_manifest, rec.to_dict())
             audit.emit("ingest", rec.source_id, status=rec.ingest_status.value,
                        rights=rec.rights_status.value)

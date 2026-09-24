@@ -12,9 +12,9 @@ from . import __version__
 from .audit.events import AuditLog
 from .audit.reports import build_funnel_report
 from .config import (
+    build_detectors,
     build_gate_and_adapters,
     load_policy_config,
-    resolve_detectors,
     technical_thresholds,
 )
 from .contracts.source import SourceRecord
@@ -55,11 +55,9 @@ def cmd_sources_validate(args) -> int:
 
 def _build_pipeline(args) -> OrnixPipeline:
     policy = load_policy_config(args.policy)
-    vad_name, noise_name, avail = resolve_detectors(getattr(args, "models_lock", None))
+    detectors = build_detectors(getattr(args, "models_lock", None))
     tech = technical_thresholds(getattr(args, "audio_profile", None))
-    pipe = OrnixPipeline(args.workdir, policy, vad_name=vad_name, noise_name=noise_name, tech=tech)
-    pipe.availability = avail
-    return pipe
+    return OrnixPipeline(args.workdir, policy, tech=tech, detectors=detectors)
 
 
 def cmd_ingest(args) -> int:
@@ -130,23 +128,42 @@ def cmd_curate(args) -> int:
     return 0
 
 
+def cmd_calibrate(args) -> int:
+    from .calibration.runner import run_calibration
+
+    pipe = _build_pipeline(args)
+    result = run_calibration(args.goldset, pipe, args.workdir,
+                             split=args.split, run_id=args.run_id)
+    paths = RunPaths.create(args.workdir, args.run_id)
+    payload = {"ok": result.ok, "split": result.split, "blockers": result.blockers,
+               "report": result.report, "stratification": result.stratification}
+    write_json(os.path.join(paths.root, "CALIBRATION_REPORT.json"),
+               {**payload, "per_clip": result.per_clip})
+    _print(payload)
+    # metrics only — thresholds remain operator-signed; leakage/no-clips => nonzero exit
+    return 0 if result.ok else 3
+
+
 def cmd_release_build(args) -> int:
     paths = RunPaths.create(args.workdir, args.run_id)
     from .exporters import build_release
-
     rows = list(read_jsonl(paths.accepted))
     for r in rows:
         r["release_id"] = args.release_id
     out = args.out or os.path.join(args.workdir, "releases", args.release_id)
-    rights_report = {"licenses": sorted({r.get("quality_policy_version", "") for r in rows}),
-                     "n_sources": len({r.get("source_id") for r in rows})}
+    rights_report = {
+        "licenses": sorted({r.get("source_license", "UNKNOWN") for r in rows}),
+        "rights_status": sorted({r.get("rights_status", "UNKNOWN") for r in rows}),
+        "n_sources": len({r.get("source_id") for r in rows}),
+        "release_target": args.release_target,
+    }
     quality_report = {}
     fq = os.path.join(paths.root, "QC_FUNNEL.json")
     if os.path.exists(fq):
         quality_report = json.load(open(fq, encoding="utf-8"))
     art = build_release(args.release_id, rows, paths.canonical_dir, out,
                         rights_report=rights_report, quality_report=quality_report,
-                        export_format=args.format)
+                        export_format=args.format, release_target=args.release_target)
     _print({"release_dir": art.release_dir, "ready": art.ready,
             "blockers": art.blockers, "n_rows": art.n_rows})
     return 0 if art.ready else 3
@@ -233,12 +250,25 @@ def build_parser() -> argparse.ArgumentParser:
     wd(cu)
     cu.set_defaults(func=cmd_curate)
 
+    cal = sub.add_parser("calibrate", help="measure FAR/FRR on the labeled gold set")
+    cal.add_argument("--goldset", required=True, help="gold set JSONL (human-labeled)")
+    cal.add_argument("--policy", required=True)
+    cal.add_argument("--models-lock", default=None)
+    cal.add_argument("--audio-profile", default=None)
+    cal.add_argument("--split", default="calibration", choices=["calibration", "heldout"])
+    cal.add_argument("--run-id", default="calibration")
+    wd(cal)
+    cal.set_defaults(func=cmd_calibrate)
+
     rel = sub.add_parser("release", help="release build/verify")
     relsub = rel.add_subparsers(dest="sub", required=True)
     rb = relsub.add_parser("build")
     rb.add_argument("--run-id", required=True)
     rb.add_argument("--release-id", required=True)
     rb.add_argument("--format", choices=["parquet", "webdataset"], default="parquet")
+    rb.add_argument("--release-target", choices=["train_only", "public"],
+                    default="train_only",
+                    help="public requires every row REDISTRIBUTION_APPROVED (fail-closed)")
     rb.add_argument("--out", default=None)
     wd(rb)
     rb.set_defaults(func=cmd_release_build)

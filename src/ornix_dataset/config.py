@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
@@ -69,26 +70,71 @@ def technical_thresholds(audio_profile: Optional[str]) -> TechnicalThresholds:
     return TechnicalThresholds(**{k: v for k, v in prof.items() if k in known})
 
 
-def resolve_detectors(models_lock: Optional[str]) -> Tuple[str, str, Dict[str, bool]]:
-    """Return (vad_name, noise_name, availability_map) from a models lock."""
-    vad_name, noise_name = "energy", "dsp"
-    avail = {"music": False, "quality": False, "speaker": False}
-    if not models_lock or not os.path.exists(models_lock):
-        return vad_name, noise_name, avail
-    lock = load_yaml(models_lock).get("detectors", {})
-    vad_name = lock.get("vad", {}).get("adapter", "energy")
-    noise_name = lock.get("noise", {}).get("adapter", "dsp")
-    # availability determined by actually instantiating adapters (fail-closed)
-    if noise_name == "panns":
-        opts = lock.get("noise", {}).get("panns", {})
-        avail["music"] = registry.create(DetectorKind.NOISE, "panns", **opts).available
-    q = lock.get("quality", {})
-    if q.get("adapter") == "dnsmos" and q.get("dnsmos"):
-        avail["quality"] = registry.create(DetectorKind.QUALITY, "dnsmos", **q["dnsmos"]).available
-    s = lock.get("speaker", {})
-    if s.get("adapter") == "pyannote" and s.get("pyannote"):
-        avail["speaker"] = registry.create(DetectorKind.SPEAKER, "pyannote", **s["pyannote"]).available
-    return vad_name, noise_name, avail
+@dataclass
+class DetectorSet:
+    """Instantiated, configured detector adapters (spec §2.1, §4).
+
+    ``noise`` (DSP hiss/hum/clipping) is always present; ``music`` is an optional
+    music-gate detector (e.g. PANNs) run *in addition* to noise. ``availability``
+    is derived from the adapters themselves — never asserted by config alone.
+    """
+    vad: Any
+    noise: Any
+    music: Optional[Any]
+    quality: Any
+    speaker: Any
+    provenance: List[Dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def availability(self) -> Dict[str, bool]:
+        return {
+            "music": bool(self.music is not None and self.music.available),
+            "quality": bool(self.quality.available),
+            "speaker": bool(self.speaker.available),
+        }
+
+
+def build_detectors(models_lock: Optional[str]) -> DetectorSet:
+    """Instantiate detectors from a models lock, passing each adapter its real
+    options (model_path/weights_sha256/license flags). Missing/unverified weights
+    => the adapter reports UNAVAILABLE and the dependent gate fails closed."""
+    lock: Dict[str, Any] = {}
+    if models_lock and os.path.exists(models_lock):
+        lock = load_yaml(models_lock).get("detectors", {})
+
+    def opts(section: str, adapter: str, kind: "DetectorKind") -> Dict[str, Any]:
+        sec = lock.get(section, {}) or {}
+        raw = dict(sec.get(adapter, {}) or {})
+        # keep only keys the adapter constructor actually accepts (drop e.g. bare
+        # `license:` documentation keys) so a lock stanza never crashes construction.
+        try:
+            import inspect
+            factory = registry._factories[kind.value][adapter]
+            params = set(inspect.signature(factory).parameters)
+            return {k: v for k, v in raw.items() if k in params}
+        except (KeyError, ValueError, TypeError):
+            return raw
+
+    vad_name = (lock.get("vad", {}) or {}).get("adapter", "energy")
+    vad = registry.create(DetectorKind.VAD, vad_name, **opts("vad", vad_name, DetectorKind.VAD))
+
+    # DSP noise is always available (hiss/hum/clipping); music is a separate gate.
+    noise = registry.create(DetectorKind.NOISE, "dsp", **opts("noise", "dsp", DetectorKind.NOISE))
+    music = None
+    music_name = (lock.get("music", {}) or {}).get("adapter")
+    if music_name:
+        music = registry.create(DetectorKind.NOISE, music_name,
+                                **opts("music", music_name, DetectorKind.NOISE))
+
+    quality = registry.create(DetectorKind.QUALITY, "dnsmos",
+                              **opts("quality", "dnsmos", DetectorKind.QUALITY))
+    speaker = registry.create(DetectorKind.SPEAKER, "pyannote",
+                              **opts("speaker", "pyannote", DetectorKind.SPEAKER))
+
+    ds = DetectorSet(vad=vad, noise=noise, music=music, quality=quality, speaker=speaker)
+    ds.provenance = [a.info().to_dict() for a in (vad, noise, music, quality, speaker)
+                     if a is not None]
+    return ds
 
 
 def load_policy_config(path: str) -> PolicyConfig:

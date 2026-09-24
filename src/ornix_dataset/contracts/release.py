@@ -28,6 +28,10 @@ class ReleaseRow:
     quality_gate: str
     split: str
     release_id: str
+    # rights carried onto every published row (spec §0.2.6 — gated != redistributable)
+    source_license: str = "UNKNOWN"
+    rights_status: str = "UNKNOWN"
+    redistribution_permitted: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -37,8 +41,13 @@ class ReleaseRow:
         allowed = cls.__dataclass_fields__.keys()
         return cls(**{k: v for k, v in d.items() if k in allowed})
 
-    def validate(self) -> None:
-        """Fail-closed structural invariants for a publishable row (spec §6.3)."""
+    def validate(self, release_target: str = "train_only") -> None:
+        """Fail-closed structural invariants for a publishable row (spec §6.3).
+
+        ``release_target='public'`` additionally requires the row carry explicit
+        redistribution rights; ``TRAIN_ONLY`` (or any non-approved status) can
+        never appear in a public release, regardless of operator memory.
+        """
         if self.quality_gate != "ACCEPT":
             raise ValueError(f"release row {self.audio_id} is not ACCEPT")
         if self.sample_rate != 24000 or self.channels != 1 or self.encoding != "PCM_S16LE":
@@ -49,3 +58,9 @@ class ReleaseRow:
             raise ValueError(f"release row {self.audio_id} has malformed sha256")
         if self.duration_s <= 0 or self.duration_s > 12.0:
             raise ValueError(f"release row {self.audio_id} duration {self.duration_s} out of policy")
+        if release_target == "public":
+            if self.rights_status != "REDISTRIBUTION_APPROVED" or not self.redistribution_permitted:
+                raise ValueError(
+                    f"release row {self.audio_id} not redistributable for public target "
+                    f"(rights_status={self.rights_status}, "
+                    f"redistribution_permitted={self.redistribution_permitted})")

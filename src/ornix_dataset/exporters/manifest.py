@@ -36,7 +36,8 @@ def build_release(release_id: str, rows: List[Dict[str, Any]],
                   audio_source_dir: str, out_dir: str,
                   rights_report: Optional[Dict[str, Any]] = None,
                   quality_report: Optional[Dict[str, Any]] = None,
-                  export_format: str = "parquet") -> ReleaseArtifacts:
+                  export_format: str = "parquet",
+                  release_target: str = "train_only") -> ReleaseArtifacts:
     os.makedirs(out_dir, exist_ok=True)
     audio_out = os.path.join(out_dir, "audio")
     os.makedirs(audio_out, exist_ok=True)
@@ -47,7 +48,7 @@ def build_release(release_id: str, rows: List[Dict[str, Any]],
     for r in rows:
         row = ReleaseRow.from_dict(r)
         try:
-            row.validate()
+            row.validate(release_target=release_target)
         except ValueError as e:
             blockers.append(f"ROW_INVALID:{row.audio_id}:{e}")
             continue
@@ -94,6 +95,12 @@ def build_release(release_id: str, rows: List[Dict[str, Any]],
     for row in validated:
         if row.get("quality_gate") != "ACCEPT":
             blockers.append(f"NON_ACCEPT_ROW:{row.get('audio_id')}")
+        if release_target == "public":
+            if (row.get("rights_status") != "REDISTRIBUTION_APPROVED"
+                    or not row.get("redistribution_permitted")):
+                blockers.append(f"NON_REDISTRIBUTABLE_ROW:{row.get('audio_id')}")
+
+    ready_payload_extra = {"release_target": release_target}
 
     # 5. checksums over every emitted file
     _write_manifest_sha(out_dir, audio_out)
@@ -105,6 +112,7 @@ def build_release(release_id: str, rows: List[Dict[str, Any]],
         "n_rows": len(validated), "analyzer_version": __version__,
         "built_utc": utc_now_iso(),
         "export_format": export_format,
+        **ready_payload_extra,
     }
     if ready:
         write_json(os.path.join(out_dir, "RELEASE_READY.json"), ready_payload)

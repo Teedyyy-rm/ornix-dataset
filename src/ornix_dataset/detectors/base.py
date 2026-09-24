@@ -33,6 +33,7 @@ class AdapterInfo:
     weights_sha256: Optional[str] = None
     license: Optional[str] = None
     is_heuristic: bool = False  # True => cannot satisfy a required ML gate alone
+    detects_music: bool = False  # True => this detector can confirm music-under-speech
     reason: Optional[str] = None  # why UNAVAILABLE
 
     def to_dict(self) -> Dict[str, Any]:

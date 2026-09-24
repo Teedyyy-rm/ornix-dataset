@@ -30,3 +30,6 @@ htmlcov/
 **/review/
 **/quarantine/
 **/releases/
+
+# Agent/editor scratch
+.zcode/

@@ -64,7 +64,7 @@ def _dir_bytes(path: str) -> int:
 
 
 def validate_approval(receipt: ApprovalReceipt, release_dir: str,
-                      repo_id: str) -> Tuple[bool, List[str]]:
+                      repo_id: str, revision: str | None = None) -> Tuple[bool, List[str]]:
     reasons: List[str] = []
     try:
         digest = release_digest(release_dir)
@@ -74,6 +74,10 @@ def validate_approval(receipt: ApprovalReceipt, release_dir: str,
         reasons.append("RELEASE_DIGEST_MISMATCH")
     if receipt.repo_id != repo_id:
         reasons.append("REPO_ID_MISMATCH")
+    # the approval authorizes exactly one destination revision — a publish to any
+    # other branch/ref is out of scope even if repo + digest match.
+    if revision is not None and receipt.revision != revision:
+        reasons.append("REVISION_MISMATCH")
     if not receipt.license_ack:
         reasons.append("LICENSE_NOT_ACKNOWLEDGED")
     try:

@@ -8,6 +8,7 @@ from .metrics import (
     coverage,
     calibration_report,
 )
+from .runner import CalibrationResult, run_calibration
 
 __all__ = [
     "GoldClip",
@@ -19,4 +20,6 @@ __all__ = [
     "false_reject_rate",
     "coverage",
     "calibration_report",
+    "CalibrationResult",
+    "run_calibration",
 ]

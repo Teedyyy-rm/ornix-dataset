@@ -56,8 +56,10 @@ ornix-dataset qc --run-id run1 --policy configs/quality_policy.pilot.yaml \
 ornix-dataset review export --run-id run1 --workdir work
 
 # 4. build an immutable, ACCEPT-only release (RELEASE_READY.json only if clean)
+#    --release-target train_only (default) | public. public FAILS CLOSED unless
+#    every row is REDISTRIBUTION_APPROVED + redistribution_permitted.
 ornix-dataset release build --run-id run1 --release-id ornix-vi-0.1 \
-    --format parquet --workdir work
+    --format parquet --release-target train_only --workdir work
 
 # 5. offline verification (readback 24k/mono/PCM16, sha, no secrets, manifest)
 ornix-dataset release verify --release-dir work/releases/ornix-vi-0.1
@@ -65,6 +67,41 @@ ornix-dataset release verify --release-dir work/releases/ornix-vi-0.1
 # 6. publish — DRY-RUN by default; prints the upload plan, touches no network
 ornix-dataset publish --release-dir work/releases/ornix-vi-0.1 \
     --repo-id Teedyyy-rm/Ornix-Datasets
+```
+
+## Optional ML detectors (fail-closed, checksum-pinned)
+
+Detectors are pluggable; the pipeline never auto-downloads or substitutes weights.
+Provision the permissive ones (Silero VAD = MIT, DNSMOS ONNX = MIT code) and pin
+their sha256, then enable them in a models lock:
+
+```bash
+# fetch + print sha256 for Silero VAD and DNSMOS (verify licenses yourself)
+python scripts/fetch_models.py --dest work/models
+
+# paste the printed model_path/weights_sha256 into a models lock and set
+# quality.dnsmos.license_ack: true only after reviewing the weights terms.
+# configs/models.lock.example.yaml already carries the verified sha256 values.
+```
+
+PANNs (music-under-speech) needs `torch` + a checkpoint whose AudioSet terms you
+have verified; pyannote (overlapped speech) is **gated** — it needs a Hugging Face
+token and acceptance of the model terms. Both stay `UNAVAILABLE` (fail-closed)
+until provisioned, and the policy engine fails the dependent required gate.
+
+## Calibration (operator-gated thresholds)
+
+`calibrate` runs the real QC pipeline over a human-labeled gold set and reports
+false-accept / false-reject / coverage. It refuses to run if calibration and
+heldout share any source/speaker/recording-family (tuning-on-test). It reports
+metrics only — **publishable thresholds are signed off by a human operator on
+genuine audio**, never auto-set from these numbers.
+
+```bash
+# synthetic gold set is for harness/plumbing validation ONLY (not real thresholds)
+python scripts/make_goldset.py --out work/goldset
+ornix-dataset calibrate --goldset work/goldset/goldset.jsonl \
+    --policy configs/quality_policy.pilot.yaml --workdir work
 ```
 
 ## Publishing (operator-gated, Phase 7)

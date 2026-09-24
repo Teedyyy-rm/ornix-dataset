@@ -5,8 +5,8 @@ import os
 import pytest
 
 from ornix_dataset.audit.events import AuditLog
-from ornix_dataset.config import (build_gate_and_adapters, load_policy_config,
-                                   resolve_detectors, technical_thresholds)
+from ornix_dataset.config import (build_detectors, build_gate_and_adapters,
+                                   load_policy_config, technical_thresholds)
 from ornix_dataset.contracts.enums import DecisionState
 from ornix_dataset.pipeline import OrnixPipeline, RunPaths
 from ornix_dataset.util.jsonl import read_jsonl
@@ -82,12 +82,15 @@ def test_split_no_leakage(tmp_path, sources_config):
     assert all(len(v) == 1 for v in by_group.values())
 
 
-def test_resolve_detectors_fail_closed():
-    vad, noise, avail = resolve_detectors("configs/models.lock.example.yaml")
+def test_build_detectors_fail_closed():
+    ds = build_detectors("configs/models.lock.example.yaml")
+    avail = ds.availability
     # licensed models unavailable offline -> availability stays False (fail-closed)
     assert avail["music"] is False
     assert avail["quality"] is False
     assert avail["speaker"] is False
+    # DSP noise + energy VAD are always constructible (heuristic, no weights)
+    assert ds.noise is not None and ds.vad is not None
 
 
 def test_technical_thresholds_from_profile():

@@ -71,12 +71,24 @@ class EnergyVadAdapter(VadAdapter):
 
 @registry.register(DetectorKind.VAD, "silero")
 class SileroVadAdapter(VadAdapter):
-    """Silero VAD (ONNX). UNAVAILABLE unless a local, checksum-pinned model is
-    provided via ``model_path`` (fail-closed — never auto-downloads weights)."""
+    """Silero VAD (ONNX v5). UNAVAILABLE unless a local, checksum-pinned model is
+    provided via ``model_path`` (fail-closed — never auto-downloads weights).
 
-    def __init__(self, model_path: Optional[str] = None, weights_sha256: Optional[str] = None):
+    Runs the model over 512-sample windows at 16 kHz (the v5 contract), thresholds
+    the per-window speech probability, then merges to intervals in analysis-view
+    seconds. Threshold/min-duration are tunable per dataset (Silero guidance)."""
+
+    _WIN = 512      # v5 window size at 16 kHz
+    _SR = 16000
+
+    def __init__(self, model_path: Optional[str] = None, weights_sha256: Optional[str] = None,
+                 threshold: float = 0.5, min_speech_s: float = 0.15,
+                 min_silence_s: float = 0.1):
         self.model_path = model_path
         self.weights_sha256 = weights_sha256
+        self.threshold = threshold
+        self.min_speech_s = min_speech_s
+        self.min_silence_s = min_silence_s
         self._session = None
         self._reason: Optional[str] = None
         self._try_load()
@@ -111,7 +123,36 @@ class SileroVadAdapter(VadAdapter):
                            model_id="silero-vad", weights_sha256=self.weights_sha256,
                            license="MIT")
 
-    def infer(self, mono: np.ndarray, sr: int) -> List[List[float]]:  # pragma: no cover
+    def _probs(self, mono16k: np.ndarray) -> np.ndarray:
+        state = np.zeros((2, 1, 128), dtype=np.float32)
+        sr = np.array(self._SR, dtype=np.int64)
+        out = []
+        for i in range(0, len(mono16k) - self._WIN + 1, self._WIN):
+            chunk = mono16k[i:i + self._WIN].astype(np.float32)[None, :]
+            prob, state = self._session.run(None, {"input": chunk, "state": state, "sr": sr})
+            out.append(float(np.asarray(prob).reshape(-1)[0]))
+        return np.asarray(out, dtype=np.float32)
+
+    def infer(self, mono: np.ndarray, sr: int) -> List[List[float]]:
         if self._session is None:
             raise RuntimeError(f"silero VAD unavailable: {self._reason}")
-        raise NotImplementedError("wire Silero inference once weights are provisioned")
+        from ..detectors.music_noise import _resample_to  # shared band-limited resample
+
+        audio = _resample_to(mono, sr, self._SR) if sr != self._SR else mono.astype(np.float32)
+        probs = self._probs(audio)
+        if probs.size == 0:
+            return []
+        win_s = self._WIN / self._SR
+        active = probs >= self.threshold
+        intervals: List[List[float]] = []
+        start = None
+        for i, a in enumerate(active):
+            if a and start is None:
+                start = i
+            elif not a and start is not None:
+                intervals.append([start * win_s, i * win_s])
+                start = None
+        if start is not None:
+            intervals.append([start * win_s, len(active) * win_s])
+        intervals = _merge_gaps(intervals, self.min_silence_s)
+        return [iv for iv in intervals if (iv[1] - iv[0]) >= self.min_speech_s]

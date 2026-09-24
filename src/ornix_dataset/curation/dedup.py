@@ -7,7 +7,7 @@ is grouped and cannot leak across splits.
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 import numpy as np
 
@@ -38,8 +38,37 @@ def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b))  # inputs are unit-normalized
 
 
+def _candidate_pairs_lsh(fingerprints: Dict[str, np.ndarray], ids: List[str],
+                         n_planes: int = 16, n_tables: int = 8,
+                         seed: int = 1234) -> Set[Tuple[str, str]]:
+    """Random-hyperplane LSH: bucket unit vectors by sign bits, return only the
+    within-bucket pairs. Cosine-similar vectors collide with high probability, so
+    exact comparison happens on O(candidates) pairs instead of O(N^2)."""
+    dim = int(next(iter(fingerprints.values())).shape[0]) if fingerprints else 0
+    rng = np.random.default_rng(seed)
+    mat = np.stack([fingerprints[i] for i in ids]).astype(np.float64)  # (N, dim)
+    candidates: Set[Tuple[str, str]] = set()
+    for _ in range(n_tables):
+        planes = rng.standard_normal((dim, n_planes))
+        bits = (mat @ planes) >= 0.0                      # (N, n_planes)
+        weights = (1 << np.arange(n_planes))              # pack sign bits -> bucket key
+        keys = (bits.astype(np.int64) * weights).sum(axis=1)
+        buckets: Dict[int, List[int]] = {}
+        for row, key in enumerate(keys.tolist()):
+            buckets.setdefault(key, []).append(row)
+        for members in buckets.values():
+            if len(members) < 2:
+                continue
+            for a in range(len(members)):
+                for b in range(a + 1, len(members)):
+                    i, j = members[a], members[b]
+                    candidates.add((ids[i], ids[j]) if ids[i] < ids[j] else (ids[j], ids[i]))
+    return candidates
+
+
 def near_duplicate_groups(fingerprints: Dict[str, np.ndarray],
-                          threshold: float = 0.985) -> List[List[str]]:
+                          threshold: float = 0.985,
+                          n_planes: int = 16, n_tables: int = 8) -> List[List[str]]:
     ids = list(fingerprints.keys())
     parent = {i: i for i in ids}
 
@@ -54,10 +83,12 @@ def near_duplicate_groups(fingerprints: Dict[str, np.ndarray],
         if ra != rb:
             parent[ra] = rb
 
-    for i in range(len(ids)):
-        for j in range(i + 1, len(ids)):
-            if _cosine(fingerprints[ids[i]], fingerprints[ids[j]]) >= threshold:
-                union(ids[i], ids[j])
+    if len(ids) >= 2:
+        candidates = _candidate_pairs_lsh(fingerprints, ids,
+                                          n_planes=n_planes, n_tables=n_tables)
+        for a, b in candidates:
+            if _cosine(fingerprints[a], fingerprints[b]) >= threshold:
+                union(a, b)
     clusters: Dict[str, List[str]] = {}
     for i in ids:
         clusters.setdefault(find(i), []).append(i)

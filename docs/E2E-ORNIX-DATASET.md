@@ -7,23 +7,23 @@
 
 ## ✅ Implementation Progress (worker self-report — không tự tuyên bố APPROVED)
 
-> Cập nhật: 2026-09-24. State machine: `NOT_STARTED → IN_PROGRESS → IMPLEMENTED → VERIFIED → AWAITING_APPROVAL → APPROVED`.
-> Worker chỉ được đưa tới **VERIFIED** (code + tests có evidence). `AWAITING_APPROVAL` = cần operator ký duyệt (ngưỡng calibration, scope-freeze, quyền publish). Chưa có phase nào `APPROVED`/`PUBLISHED` — đúng fail-closed.
-> Evidence: `PYTHONPATH=src:tests python -m pytest` → **68 passed** (unit 52 + integration 7 + acceptance 9), offline/CPU.
+> Cập nhật: 2026-09-24. State machine: `NOT_STARTED → IN_PROGRESS → IMPLEMENTED → INFRA_VERIFIED → VERIFIED → AWAITING_APPROVAL → APPROVED`.
+> `INFRA_VERIFIED` = plumbing/harness có test evidence nhưng **chưa** kiểm chứng trên audio thật/nhãn người. `VERIFIED` = đã kiểm chứng hành vi thật. Worker không tự đưa tới `APPROVED`. Chưa có phase nào `APPROVED`/`PUBLISHED` — đúng fail-closed.
+> Evidence: `PYTHONPATH=src:tests python -m pytest` → **91 passed** (offline/CPU; real-model tests tự-skip khi chưa có weights). Real weights (Silero VAD MIT, DNSMOS ONNX) đã tải + pin sha256 + chạy inference thật: `scripts/fetch_models.py` + `tests/integration/test_real_models.py` (DNSMOS phân biệt clean/noisy; Silero nạp + chạy, cần audio giọng thật để chứng minh positive detection).
 
 | Phase | Hạng mục | State | Module / Evidence |
 |---|---|---|---|
 | 0 | Source registry, rights matrix, permission gate, schema/policy draft | ✅ VERIFIED (tooling) · ⏳ AWAITING_APPROVAL (scope-freeze sign-off) | `ingestion/permissions.py`, `configs/sources.example.yaml`; T-012 |
-| 1 | Local + HF read-only adapters, immutable staging, idempotent manifest | ✅ VERIFIED | `ingestion/`, `pipeline.ingest_and_stage`; integration idempotency test |
+| 1 | Local + HF read-only adapters, immutable staging, idempotent manifest, HF materialize | ✅ VERIFIED | `ingestion/`, `pipeline.ingest_and_stage`, `hf.materialize` (download→content-sha→immutable); idempotency + materialize mock tests |
 | 2 | Technical WAV gate + canonical 24k mono PCM16 renderer | ✅ VERIFIED | `dsp/` (decode/resample/features/technical/render); T-008/T-009/T-010 |
-| 3 | VAD, windowing, event/noise detectors (pluggable, fail-closed) | ✅ VERIFIED | `detectors/`; registry + DSP-never-music + VAD coverage tests |
-| 4 | Quality/overlap/transcript adapters + calibration harness | ✅ VERIFIED (harness) · ⏳ AWAITING_APPROVAL (gold-set labels + operator-signed thresholds) | `calibration/`, `detectors/quality.py`, `detectors/speaker.py`; calibration tests |
-| 5 | Deterministic policy engine, review, segmentation, dedup, leakage-safe split | ✅ VERIFIED | `curation/`; T-001..T-007, T-011, determinism + split-leakage tests |
-| 6 | Release build (Parquet/WebDataset), dataset card, offline verify | ✅ VERIFIED | `exporters/`; T-015 verify + tamper-detect tests |
-| 7 | HF staged publisher: dry-run default, approval gate, remote verify | ✅ VERIFIED (dry-run + gate logic) · ⏳ AWAITING_APPROVAL (real upload needs operator receipt + token) | `publishing/`; T-013/T-014 blocked-without-approval/token tests |
+| 3 | VAD, windowing, event/noise + music detectors (pluggable, fail-closed) | ✅ INFRA_VERIFIED · ⚠️ REAL_MODEL: Silero/DNSMOS tải+pin+chạy thật (test_real_models); PANNs music + pyannote overlap vẫn AWAITING (torch/gated token) | `detectors/`, `config.build_detectors`; registry + DSP-never-music + real-ONNX load/run tests |
+| 4 | Quality/overlap/transcript adapters + calibration flow | ✅ INFRA_VERIFIED (runner + `calibrate` CLI + separation guard) · ⏳ AWAITING_APPROVAL (CALIBRATION_NOT_PERFORMED: cần gold-set nhãn người + ngưỡng operator ký) | `calibration/` (goldset/metrics/**runner**), `detectors/quality.py`, `detectors/speaker.py`; calibration runner + leakage tests |
+| 5 | Deterministic policy engine, review, segmentation (snap-to-silence), LSH dedup, leakage-safe split | ✅ VERIFIED | `curation/`; T-001..T-007, T-011, segmentation snap+uncertain, LSH-scale dedup, determinism + split-leakage tests |
+| 6 | Release build (Parquet/WebDataset), rights-safe gating, dataset card, offline verify | ✅ VERIFIED | `exporters/`, `ReleaseRow.validate(release_target)` (TRAIN_ONLY≠public); T-015 + rights-gate tests |
+| 7 | HF staged publisher: dry-run default, approval gate (digest+revision bound), exact-set remote verify | ✅ VERIFIED (dry-run + gate logic) · ⏳ AWAITING_APPROVAL (real upload needs operator receipt + token) | `publishing/`; T-013/T-014 blocked-without-approval/token, revision-bind + exact-set remote_verify tests |
 | 8 | Cache, checkpoint, worker queue, retention/takedown, runbook | ✅ VERIFIED | `ops/`, `README.md`; cache-invalidation/checkpoint-idempotent/takedown tests |
 
-**Test matrix coverage (T-001..T-016):** T-001/T-002/T-004/T-005/T-006/T-007/T-012 `tests/unit/test_policy.py`; T-003/T-011 `tests/unit/test_curation.py`; T-008/T-009/T-010 `tests/unit/test_technical.py`; T-012 (rights gate) also `tests/unit/test_infra.py`; T-013/T-014 `tests/acceptance/test_release_publish.py` + `test_cli_e2e.py`; T-015 `tests/acceptance/test_release_publish.py`; T-016 reproducible-digest `tests/acceptance/test_release_publish.py`. **Partial by design (need operator/live remote, not auto-claimed):** T-006 metallic/codec-artifact *detection* awaits the licensed quality model — only the fail-closed invariant (high metric cannot override a confirmed defect; UNKNOWN→REVIEW) is tested; T-014 real partial-upload/resume and T-016 cross-platform bitwise reproducibility need a live HF remote + operator (Phase 7 live-network negatives 403/429 likewise).
+**Test matrix coverage (T-001..T-016):** T-001/T-002/T-004/T-005/T-006/T-007/T-012 `tests/unit/test_policy.py`; T-003/T-011 + segmentation-snap + LSH-dedup `tests/unit/test_curation.py`; T-008/T-009/T-010 `tests/unit/test_technical.py`; rights-safe release `tests/unit/test_release_rights.py`; HF materialize `tests/unit/test_hf_materialize.py`; publishing hardening (exact-set + revision-bind) `tests/unit/test_publishing.py`; real ONNX weights `tests/integration/test_real_models.py`; calibration runner `tests/integration/test_calibration_runner.py`; T-013/T-014/T-015/T-016 `tests/acceptance/`. **Explicitly NOT auto-claimed:** PANNs music + pyannote overlap real detection (need torch/gated token); publishable calibration thresholds (need human-labeled audio, operator-signed — CALIBRATION_NOT_PERFORMED); real partial-upload/resume + cross-platform bitwise reproducibility (need live HF remote).
 
 
 

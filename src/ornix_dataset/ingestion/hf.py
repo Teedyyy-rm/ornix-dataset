@@ -8,11 +8,12 @@ closed if huggingface_hub is missing or the revision cannot be resolved.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Iterator, List, Optional
 
 from ..contracts.enums import IngestStatus, RightsStatus
 from ..contracts.source import SourceRecord
-from ..util.hashing import short_id
+from ..util.hashing import sha256_file, short_id
 from ..util.timeutil import utc_now_iso
 from .base import SourceAdapter
 from .local import AUDIO_EXTS
@@ -92,3 +93,39 @@ class HfSourceAdapter(SourceAdapter):
             ingest_status=status, ingestion_timestamp_utc=utc_now_iso(),
             reason_codes=reasons,
         )
+
+    def materialize(self, record: SourceRecord, dest_dir: str) -> str:
+        """Download the pinned-commit blob, verify its content SHA, stage immutably.
+
+        Downloads ``record.original_file_id`` at the exact resolved commit
+        (``record.source_revision``) into ``dest_dir``. When the source carries a
+        verified LFS blob sha256, the downloaded bytes MUST match it or we raise
+        (fail-closed — never stage unverified content). Returns the staged path
+        and sets it read-only (0o444) so the byte-exact provenance is immutable.
+        """
+        try:
+            from huggingface_hub import hf_hub_download
+        except Exception as e:  # fail-closed
+            raise RuntimeError(f"huggingface_hub unavailable: {e}")
+        os.makedirs(dest_dir, exist_ok=True)
+        local = hf_hub_download(
+            repo_id=self.repo_id, filename=record.original_file_id,
+            revision=record.source_revision, repo_type="dataset", token=self.token)
+        content_sha = sha256_file(local)
+        # only enforce when we actually resolved a remote blob sha (not a derived id)
+        if "SOURCE_SHA_UNVERIFIED_FROM_REMOTE" not in record.reason_codes:
+            if content_sha != record.source_sha256:
+                raise RuntimeError(
+                    f"content sha mismatch for {record.source_id}: "
+                    f"downloaded {content_sha} != pinned {record.source_sha256}")
+        else:
+            # no remote blob sha was available; bind provenance to the bytes we got
+            record.source_sha256 = content_sha
+        ext = os.path.splitext(record.original_file_id)[1] or ".bin"
+        staged = os.path.join(dest_dir, f"{record.source_id}{ext}")
+        if not os.path.exists(staged):
+            import shutil
+            shutil.copyfile(local, staged)
+            os.chmod(staged, 0o444)  # immutable staging
+        record.staged_path = staged
+        return staged

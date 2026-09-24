@@ -2,27 +2,36 @@
 # is only usable when a local, checksum-verified weight file is present AND its
 # license is acknowledged. Missing/unverified => adapter reports UNAVAILABLE and
 # the dependent required gate fails closed. NEVER auto-download or substitute.
+#
+# Provision weights with:  python scripts/fetch_models.py --dest work/models
+# then paste the printed sha256 values below and set adapter: <name>.
 detectors:
   vad:
     adapter: energy            # energy (heuristic, always available) | silero
-    # silero:
-    #   model_path: ./work/models/silero_vad.onnx
-    #   weights_sha256: "<64-hex>"
-    #   license: MIT
+    # To enable Silero VAD (MIT), fetch it and pin the sha256 (verified 2026-09):
+    silero:
+      model_path: ./work/models/silero_vad.onnx
+      weights_sha256: "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
+      license: MIT
   noise:
-    adapter: dsp               # dsp (available) | panns
+    adapter: dsp               # dsp is ALWAYS on (hiss/hum/clipping); music is separate
+  music:
+    # Optional music-gate detector, run IN ADDITION to dsp noise. UNAVAILABLE
+    # until a checksum-pinned PANNs checkpoint is provisioned + terms verified.
+    adapter: null              # panns (requires panns_inference + checkpoint)
     # panns:
     #   model_path: ./work/models/Cnn14.pth
     #   weights_sha256: "<64-hex>"
     #   license: "<verify AudioSet weights terms>"
   quality:
     adapter: dnsmos            # UNAVAILABLE until provisioned + license acknowledged
-    # dnsmos:
-    #   model_path: ./work/models/dnsmos_p835.onnx
-    #   weights_sha256: "<64-hex>"
-    #   license_ack: false     # verify code (MIT) vs weights terms separately
+    # DNSMOS P.835 ONNX (code MIT; verify weights terms). sha256 verified 2026-09:
+    dnsmos:
+      model_path: ./work/models/dnsmos_p835.onnx
+      weights_sha256: "269fbebdb513aa23cddfbb593542ecc540284a91849ac50516870e1ac78f6edd"
+      license_ack: false       # SET true only after verifying code (MIT) vs weights terms
   speaker:
-    adapter: pyannote          # UNAVAILABLE until access terms acknowledged
+    adapter: pyannote          # GATED: UNAVAILABLE until HF access terms acknowledged
     # pyannote:
-    #   model_path: ./work/models/pyannote_overlap
-    #   access_ack: false
+    #   model_path: pyannote/overlapped-speech-detection
+    #   use_auth_token: true   # requires HF token + accepting model terms on the Hub
