@@ -1,0 +1,28 @@
+# Model lock (spec §4, §8). Each ML back-end is OPTIONAL and pluggable. An entry
+# is only usable when a local, checksum-verified weight file is present AND its
+# license is acknowledged. Missing/unverified => adapter reports UNAVAILABLE and
+# the dependent required gate fails closed. NEVER auto-download or substitute.
+detectors:
+  vad:
+    adapter: energy            # energy (heuristic, always available) | silero
+    # silero:
+    #   model_path: ./work/models/silero_vad.onnx
+    #   weights_sha256: "<64-hex>"
+    #   license: MIT
+  noise:
+    adapter: dsp               # dsp (available) | panns
+    # panns:
+    #   model_path: ./work/models/Cnn14.pth
+    #   weights_sha256: "<64-hex>"
+    #   license: "<verify AudioSet weights terms>"
+  quality:
+    adapter: dnsmos            # UNAVAILABLE until provisioned + license acknowledged
+    # dnsmos:
+    #   model_path: ./work/models/dnsmos_p835.onnx
+    #   weights_sha256: "<64-hex>"
+    #   license_ack: false     # verify code (MIT) vs weights terms separately
+  speaker:
+    adapter: pyannote          # UNAVAILABLE until access terms acknowledged
+    # pyannote:
+    #   model_path: ./work/models/pyannote_overlap
+    #   access_ack: false

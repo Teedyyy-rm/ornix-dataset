@@ -1,0 +1,18 @@
+# PILOT policy (train_only). Uses only DSP-derived gates that are available
+# without licensed ML weights, so a local pilot corpus can flow end-to-end for
+# infrastructure testing. It is NOT valid for public redistribution and does not
+# certify absence of music/overlap (those gates are intentionally not required).
+policy_version: ornix-qc-pilot-v1
+release_target: train_only
+required_checks:
+  - has_speech
+  - no_clipping
+  - no_severe_noise_overlap
+  - rights_ok
+
+min_speech_ratio: 0.3
+max_clip_ratio: 0.02
+hiss_overlap_max_severity: N2
+music_overlap_forbidden: false
+single_speaker_required: false
+accept_severities: [N0, N1, N2]

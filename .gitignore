@@ -1,0 +1,32 @@
+# Working directories — never committed, never uploaded (spec §0.2.6, §7)
+work/
+!work/.gitkeep
+
+# Secrets & tokens
+*.token
+.env
+.env.*
+*_token.txt
+hf_token*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Raw / rejected / review / quarantine staging (must never be published)
+**/raw/
+**/rejected/
+**/review/
+**/quarantine/
+**/releases/

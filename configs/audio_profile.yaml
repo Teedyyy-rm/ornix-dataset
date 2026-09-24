@@ -1,0 +1,16 @@
+# Canonical audio output profile (spec §0.1). These are fixed release invariants.
+audio_output:
+  sample_rate: 24000
+  channels: 1
+  encoding: PCM_S16LE
+  downmix_policy: mean        # mean | first (checked for phase cancellation)
+
+technical_thresholds:
+  min_duration_s: 0.4
+  max_duration_s: 12.0
+  max_duration_pre_segment_s: 600.0   # longer sources -> segmentation, not reject
+  max_dc_offset: 0.02
+  max_clipping_ratio: 0.01
+  min_rms: 0.0001
+  duration_tolerance_s: 0.05
+  bandwidth_ratio_warn: 0.5           # eff_bw/(sr/2) below this -> low-bandwidth flag

@@ -1,0 +1,12 @@
+# Publish approval receipt (spec §7). A real publish binds ALL of these; any
+# mismatch/expiry => STOP. Generate release_digest with:
+#   ornix-dataset release verify --release-dir <dir>   (prints the digest)
+release_digest: "<64-hex digest of the built release MANIFEST.sha256>"
+repo_id: Teedyyy-rm/Ornix-Datasets
+revision: refs/pr/ornix-staging      # staged revision; never overwrites main history
+max_bytes: 5368709120                 # 5 GiB upload quota for this release
+operator_id: "operator@ornix.example"
+expires_utc: "2026-09-25T00:00:00Z"   # UTC; publisher STOPs after this
+policy_version: ornix-qc-v1
+license_ack: false                    # set true only after verifying redistribution rights
+allow_create_repo: false

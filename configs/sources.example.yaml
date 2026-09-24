@@ -1,0 +1,28 @@
+# Example source registry (spec §6.1, §7). Rights are DECLARED here — never
+# inferred from a dataset being public/gated. Unknown rights => LICENSE_REVIEW.
+sources:
+  - name: local_pilot
+    type: local
+    root: ./data/pilot
+    source_revision: pilot-2026-09-24
+    probe: true
+    # optional JSONL sidecar keyed by relative path or basename:
+    #   {"file": "spk01/utt001.wav", "source_transcript": "...", "source_speaker_ref": "spk01",
+    #    "source_language": "vi", "transcript_verified": true}
+    metadata_file: null
+    rights:
+      rights_status: TRAIN_ONLY          # REDISTRIBUTION_APPROVED | TRAIN_ONLY | LICENSE_REVIEW | FORBIDDEN
+      redistribution_permitted: false
+      commercial_training_permitted: UNKNOWN
+      note: "pilot local corpus; redistribution not yet cleared"
+
+  - name: hf_readonly_example
+    type: hf
+    repo_id: some-org/some-vi-speech
+    revision: main                        # pinned to a commit SHA at scan time
+    allow_patterns: ["*.wav", "*.flac"]
+    rights:
+      rights_status: LICENSE_REVIEW
+      redistribution_permitted: false
+      commercial_training_permitted: UNKNOWN
+      note: "public availability != redistribution permission; needs review"

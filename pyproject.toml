@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ornix-dataset"
+version = "0.1.0"
+description = "Ornix Labs — end-to-end Vietnamese-first speech dataset quality & curation toolkit (fail-closed)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Ornix Labs" }]
+keywords = ["speech", "dataset", "curation", "tts", "audio-quality", "vietnamese"]
+
+# Core dependencies only. Heavy ML/model runtimes are OPTIONAL by design so the
+# toolkit is never locked into a single detector/quality vendor (see §4 of the spec).
+dependencies = [
+    "numpy>=1.24",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dsp = ["scipy>=1.10", "soundfile>=0.12"]
+export = ["pyarrow>=12"]
+hf = ["huggingface_hub>=0.30"]
+# ML detector back-ends are pluggable; install only what you have rights to use.
+vad = ["onnxruntime>=1.16"]
+torch = ["torch>=2.1"]
+full = [
+    "scipy>=1.10", "soundfile>=0.12", "pyarrow>=12",
+    "huggingface_hub>=0.30", "onnxruntime>=1.16",
+]
+dev = ["pytest>=8", "pytest-cov>=4"]
+
+[project.scripts]
+ornix-dataset = "ornix_dataset.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "integration: end-to-end pipeline tests",
+    "acceptance: spec acceptance-criteria tests",
+    "network: tests that need network (skipped by default)",
+]

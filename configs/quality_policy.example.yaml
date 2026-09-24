@@ -1,0 +1,25 @@
+# STRICT PUBLIC policy (spec §5.3). Requires the music/quality/transcript gates.
+# With unlicensed detectors UNAVAILABLE, these gates evaluate to UNKNOWN and the
+# engine returns REVIEW — never ACCEPT. This is the intended fail-closed behavior:
+# you cannot certify "clean, redistributable" without the licensed evidence.
+policy_version: ornix-qc-v1
+release_target: public
+required_checks:
+  - has_speech
+  - no_clipping
+  - no_confirmed_music_overlap
+  - no_severe_noise_overlap
+  - no_interfering_speech
+  - quality_ok
+  - transcript_ok
+  - rights_ok
+
+min_speech_ratio: 0.6
+max_clip_ratio: 0.01
+hiss_overlap_max_severity: N1
+music_overlap_forbidden: true
+single_speaker_required: true
+accept_severities: [N0, N1]
+
+# NOTE: thresholds above are DRAFT and must be operator-signed after calibration
+# on the human-labeled gold set (spec §5.2). Do not treat as validated.
