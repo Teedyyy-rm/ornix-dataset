@@ -42,6 +42,30 @@ class DecisionState(str, Enum):
     LICENSE_REVIEW = "LICENSE_REVIEW"
 
 
+class SourceRateClass(str, Enum):
+    """Source sample-rate class for clean-HQ admission (Level 1, spec §Repair).
+
+    Assigned from the *measured* sample rate (never the header). Thresholds are
+    project-policy defaults held in ``configs/audio_profile.yaml``.
+    """
+
+    NATIVE_OR_HIGHER = "NATIVE_OR_HIGHER"        # sr >= canonical (24k)
+    NEAR_TARGET_UPSAMPLE = "NEAR_TARGET_UPSAMPLE"  # conditional_min <= sr < canonical
+    LOW_BANDWIDTH_SOURCE = "LOW_BANDWIDTH_SOURCE"  # low_bw_min <= sr < conditional_min
+    NARROWBAND_SOURCE = "NARROWBAND_SOURCE"        # sr < low_bw_min
+
+
+class CanonicalizationAction(str, Enum):
+    """What the canonicalization stage does (or refuses to do) for a source."""
+
+    IDENTITY = "IDENTITY"
+    DOWNSAMPLE = "DOWNSAMPLE"
+    UPSAMPLE_NEAR_TARGET = "UPSAMPLE_NEAR_TARGET"
+    REJECT_LOW_BANDWIDTH = "REJECT_LOW_BANDWIDTH"
+    REJECT_NARROWBAND = "REJECT_NARROWBAND"
+    ERROR = "ERROR"
+
+
 class Severity(str, Enum):
     """Noise impact severity (spec §3)."""
 

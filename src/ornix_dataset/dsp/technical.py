@@ -28,7 +28,12 @@ class TechnicalThresholds:
     max_clipping_ratio: float = 0.01
     min_rms: float = 1e-4  # below -> effectively silent / no speech level
     duration_tolerance_s: float = 0.05
-    bandwidth_ratio_warn: float = 0.45  # eff_bw / (sr/2) below this -> low bandwidth
+    bandwidth_ratio_warn: float = 0.45  # eff_bw / ref_nyq below this -> low bandwidth
+    # Target-aware bandwidth reference: reason relative to the useful canonical
+    # Nyquist, not blindly source_sr/2. A 48 kHz speech clip band-limited to
+    # ~10 kHz is fine because the 24 kHz target only preserves up to 12 kHz; an
+    # 8 kHz signal upsampled into a 24 kHz container is still flagged.
+    canonical_nyquist_hz: float = 12000.0
 
 
 @dataclass
@@ -120,12 +125,15 @@ def _evaluate(
     if abs(stats.dc_offset) > t.max_dc_offset:
         reasons.append(f"DC_OFFSET:{stats.dc_offset:.4f}")
 
-    # header vs measured sample-rate / bandwidth mismatch (T-008)
+    # header vs measured sample-rate / bandwidth mismatch (T-008), target-aware:
+    # compare against min(source_nyquist, canonical_nyquist) so a high-rate clean
+    # source is not penalised for lacking energy the 24 kHz target discards anyway.
     if eff_bw is not None and sr > 0:
-        nyq = sr / 2.0
-        if eff_bw < t.bandwidth_ratio_warn * nyq:
+        ref_nyq = min(sr / 2.0, t.canonical_nyquist_hz)
+        if eff_bw < t.bandwidth_ratio_warn * ref_nyq:
             low_bw = True
-            reasons.append(f"LOW_BANDWIDTH_SUSPECTED:eff_bw={eff_bw:.0f}Hz<nyq={nyq:.0f}Hz")
+            reasons.append(
+                f"LOW_BANDWIDTH_SUSPECTED:eff_bw={eff_bw:.0f}Hz<ref={ref_nyq:.0f}Hz")
 
     # duration bounds
     decision = "VALID"

@@ -63,6 +63,15 @@ class QualityEvidence:
     speaker_status: MeasurementStatus = MeasurementStatus.NOT_APPLICABLE
     transcript_match_status: MeasurementStatus = MeasurementStatus.UNKNOWN
     calibration_domain: str = "UNKNOWN"
+    # source-admission + canonicalization provenance (schema v2)
+    source_container: Optional[str] = None
+    source_lossy: Optional[bool] = None
+    source_rate_class: Optional[str] = None
+    canonicalization_action: Optional[str] = None
+    effective_bandwidth_hz: Optional[float] = None
+    low_bandwidth_suspected: bool = False
+    canonical_sha256: Optional[str] = None
+    canonical_verify_status: Optional[str] = None
     required_checks: List[str] = field(default_factory=list)
     observed_checks: Dict[str, str] = field(default_factory=dict)
     decision: DecisionState = DecisionState.REVIEW

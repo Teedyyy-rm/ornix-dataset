@@ -25,9 +25,10 @@ from .curation.transcript import transcript_match_status
 from .detectors import DetectorKind, registry
 from .detectors.windowing import intersect_intervals, total_duration
 from .dsp.audio import AudioBuffer
+from .dsp.admission import AdmissionConfig, AdmissionReport, assess_source
 from .dsp.decode import decode_to_float
 from .dsp.features import signal_stats
-from .dsp.render import render_canonical_wav
+from .dsp.render import RenderVerificationError, render_canonical_wav
 from .dsp.technical import TechnicalThresholds, run_technical_validation
 from .util.hashing import sha256_json, short_id
 from .util.io import write_json
@@ -70,11 +71,13 @@ class OrnixPipeline:
     def __init__(self, workdir: str, policy: PolicyConfig,
                  vad_name: str = "energy", noise_name: str = "dsp",
                  tech: Optional[TechnicalThresholds] = None,
+                 admission: Optional[AdmissionConfig] = None,
                  detectors: Optional[Any] = None):
         self.workdir = workdir
         self.policy = policy
         self.engine = PolicyEngine(policy)
         self.tech = tech or TechnicalThresholds()
+        self.admission_cfg = admission or AdmissionConfig()
         if detectors is not None:
             self.vad = detectors.vad
             self.noise = detectors.noise
@@ -118,9 +121,38 @@ class OrnixPipeline:
             append_jsonl(paths.evidence, ev.to_dict())
             result.evidences.append(ev)
             return result
+        # Level 1 — source admission: decide clean-HQ eligibility from *measured*
+        # evidence before spending any canonicalization. A rejected source stays
+        # auditable in evidence (no-loss) but never reaches accepted/release.
+        admission = assess_source(report, self.admission_cfg)
+        audit.emit("admission", src.source_id,
+                   rate_class=admission.source_rate_class,
+                   action=admission.canonicalization_action,
+                   admitted=admission.admitted, reasons=admission.reason_codes)
+        if not admission.admitted:
+            ev = self._reject_admission_evidence(src, report, admission)
+            append_jsonl(paths.evidence, ev.to_dict())
+            result.evidences.append(ev)
+            return result
         buf, _ = decode_to_float(src.staged_path, mono=True)
-        self._analyze_segments(src, buf, paths, audit, result)
+        self._analyze_segments(src, buf, paths, audit, result, admission)
         return result
+
+    def _reject_admission_evidence(self, src: SourceRecord, report,
+                                   admission: AdmissionReport) -> QualityEvidence:
+        return QualityEvidence(
+            segment_id="SEG_" + short_id(src.source_sha256, "admission"),
+            source_sha256=src.source_sha256, interval_start_sample=0,
+            interval_end_sample=0, analysis_sample_rate=16000,
+            decision=DecisionState.REJECT_TECH, reason_codes=admission.reason_codes,
+            source_container=admission.source_container,
+            source_lossy=admission.source_lossy,
+            source_rate_class=admission.source_rate_class,
+            canonicalization_action=admission.canonicalization_action,
+            effective_bandwidth_hz=admission.effective_bandwidth_hz,
+            low_bandwidth_suspected=admission.low_bandwidth_suspected,
+            policy_version=self.policy.policy_version, timestamp_utc=utc_now_iso(),
+        )
 
     def _reject_tech_evidence(self, src: SourceRecord, report) -> QualityEvidence:
         return QualityEvidence(
@@ -147,7 +179,8 @@ class OrnixPipeline:
             events.extend(self.music.infer(samples, sr, speech_intervals))
         return events
 
-    def _analyze_segments(self, src, buf: AudioBuffer, paths, audit, result) -> None:
+    def _analyze_segments(self, src, buf: AudioBuffer, paths, audit, result,
+                          admission: Optional[AdmissionReport] = None) -> None:
         sr = buf.sample_rate
         speech = self.vad.infer(buf.samples, sr)
         events = self._detect_noise(buf.samples, sr, speech)
@@ -166,10 +199,12 @@ class OrnixPipeline:
         for idx, (s, e) in enumerate(plan.intervals_s):
             uncertain = idx in getattr(plan, "uncertain_indices", set())
             self._process_segment(src, buf, s, e, idx, speech, paths, audit, result,
-                                   segmented=segmented, boundary_uncertain=uncertain)
+                                   segmented=segmented, boundary_uncertain=uncertain,
+                                   admission=admission)
 
     def _process_segment(self, src, buf, s, e, idx, speech, paths, audit, result,
-                         segmented: bool = False, boundary_uncertain: bool = False) -> None:
+                         segmented: bool = False, boundary_uncertain: bool = False,
+                         admission: Optional[AdmissionReport] = None) -> None:
         sr = buf.sample_rate
         a, b = int(s * sr), int(e * sr)
         seg = buf.samples[a:b]
@@ -179,14 +214,21 @@ class OrnixPipeline:
         seg_id = "SEG_" + short_id(src.source_sha256, idx, round(s, 3), round(e, 3))
         out_wav = os.path.join(paths.canonical_dir, f"{seg_id}.wav")
         try:
-            audio_sha, recipe = render_canonical_wav(seg_buf, out_wav)
-        except RuntimeError as exc:
+            audio_sha, recipe = render_canonical_wav(seg_buf, out_wav, admission=admission)
+        except (RuntimeError, RenderVerificationError) as exc:
+            # fail-closed + no-loss: a render/verify failure is an auditable ERROR
+            # evidence row, never a silently dropped segment (invariants I10/I12).
             audit.emit("render_failed", seg_id, reason=str(exc))
+            ev = self._error_evidence(src, f"CANONICAL_RENDER_FAILED:{exc}")
+            ev.segment_id = seg_id
+            append_jsonl(paths.evidence, ev.to_dict())
+            result.evidences.append(ev)
             return
         # a sub-segment cannot inherit the whole-source transcript verbatim
         transcript_valid = not (segmented or boundary_uncertain)
         ev = self._build_evidence(src, seg_buf, seg_id, a, b, s, e, speech, recipe,
-                                  transcript_valid=transcript_valid)
+                                  transcript_valid=transcript_valid,
+                                  admission=admission, canonical_sha256=audio_sha)
         decision = self.engine.decide(ev, src, self.availability)
         ev.decision = decision.decision
         ev.reason_codes = decision.reason_codes
@@ -203,7 +245,9 @@ class OrnixPipeline:
             result.accepted.append(row)
 
     def _build_evidence(self, src, seg_buf, seg_id, a, b, s, e, speech, recipe,
-                        transcript_valid: bool = True) -> QualityEvidence:
+                        transcript_valid: bool = True,
+                        admission: Optional[AdmissionReport] = None,
+                        canonical_sha256: Optional[str] = None) -> QualityEvidence:
         sr = seg_buf.sample_rate
         stats = signal_stats(seg_buf.samples)
         seg_speech = intersect_intervals(speech, [[s, e]])
@@ -251,6 +295,14 @@ class OrnixPipeline:
             speaker_overlap_intervals=speaker_overlap,
             speaker_status=speaker_status,
             transcript_match_status=tstatus, calibration_domain="UNKNOWN",
+            source_container=getattr(admission, "source_container", None),
+            source_lossy=getattr(admission, "source_lossy", None),
+            source_rate_class=getattr(admission, "source_rate_class", None),
+            canonicalization_action=recipe.canonicalization_action,
+            effective_bandwidth_hz=getattr(admission, "effective_bandwidth_hz", None),
+            low_bandwidth_suspected=bool(getattr(admission, "low_bandwidth_suspected", False)),
+            canonical_sha256=canonical_sha256,
+            canonical_verify_status=recipe.canonical_verify_status,
             policy_version=self.policy.policy_version, processing_sha256=proc_sha,
             timestamp_utc=utc_now_iso(),
         )

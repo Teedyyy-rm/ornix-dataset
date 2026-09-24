@@ -15,6 +15,7 @@ from .config import (
     build_detectors,
     build_gate_and_adapters,
     load_policy_config,
+    source_admission_config,
     technical_thresholds,
 )
 from .contracts.source import SourceRecord
@@ -57,7 +58,9 @@ def _build_pipeline(args) -> OrnixPipeline:
     policy = load_policy_config(args.policy)
     detectors = build_detectors(getattr(args, "models_lock", None))
     tech = technical_thresholds(getattr(args, "audio_profile", None))
-    return OrnixPipeline(args.workdir, policy, tech=tech, detectors=detectors)
+    admission = source_admission_config(getattr(args, "audio_profile", None))
+    return OrnixPipeline(args.workdir, policy, tech=tech, admission=admission,
+                         detectors=detectors)
 
 
 def cmd_ingest(args) -> int:

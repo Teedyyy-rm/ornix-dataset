@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterator, Optional
 
 from ..contracts.enums import IngestStatus, RightsStatus
 from ..contracts.source import SourceRecord
+from ..dsp.admission import AdmissionConfig, classify_lossy, _rate_class
 from ..dsp.decode import DecodeError, ffprobe_info
 from ..util.hashing import sha256_file, short_id
 from ..util.timeutil import utc_now_iso
@@ -62,12 +63,20 @@ class LocalSourceAdapter(SourceAdapter):
                                       RightsStatus.FORBIDDEN):
             status = IngestStatus.QUARANTINE
             reasons.append(f"RIGHTS:{decision.rights_status.value}")
+        # preliminary codec/container/rate-class from the probe (extension != codec).
+        # Authoritative admission uses the *measured* rate at analyze time.
+        codec = info.get("codec_name")
+        declared_sr = info.get("sample_rate")
+        rate_class = (_rate_class(declared_sr, AdmissionConfig()).value
+                      if declared_sr else None)
         return SourceRecord(
             source_id=source_id, source_uri=uri, source_revision=self.source_revision,
             original_file_id=rel, source_sha256=sha, source_bytes=nbytes,
-            source_mime=None, source_codec=info.get("codec_name"),
-            source_sample_rate=info.get("sample_rate"), source_channels=info.get("channels"),
+            source_mime=None, source_container=info.get("format_name"),
+            source_codec=codec, source_lossy=classify_lossy(codec),
+            source_sample_rate=declared_sr, source_channels=info.get("channels"),
             source_duration_s=info.get("duration_s"),
+            source_rate_class=rate_class,
             source_license=meta.get("source_license", "UNKNOWN"),
             license_evidence_uri=meta.get("license_evidence_uri"),
             rights_owner=meta.get("rights_owner"), consent_reference=meta.get("consent_reference"),

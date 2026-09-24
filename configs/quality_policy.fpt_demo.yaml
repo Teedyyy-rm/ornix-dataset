@@ -8,6 +8,7 @@ release_target: train_only
 required_checks:
   - has_speech
   - duration_ok
+  - source_bandwidth_ok
   - no_clipping
   - no_severe_noise_overlap
   - quality_ok

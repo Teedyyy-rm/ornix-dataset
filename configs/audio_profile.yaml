@@ -14,4 +14,19 @@ technical_thresholds:
   max_clipping_ratio: 0.01
   min_rms: 0.0001
   duration_tolerance_s: 0.05
-  bandwidth_ratio_warn: 0.5           # eff_bw/(sr/2) below this -> low-bandwidth flag
+  bandwidth_ratio_warn: 0.5           # eff_bw/ref_nyq below this -> low-bandwidth flag
+  canonical_nyquist_hz: 12000         # target-aware bandwidth reference (24 kHz Nyquist)
+
+# Level 1 — Source Audio Admission (clean-HQ eligibility). Project-policy defaults,
+# NOT universal audio standards; any change is a versioned config change. Upsampling
+# a low-rate/narrowband source does NOT restore lost bandwidth: a file is never
+# admitted merely because its output would say 24,000 Hz.
+source_admission:
+  clean_hq:
+    canonical_sample_rate: 24000
+    native_min_sample_rate: 24000        # >= this: NATIVE_OR_HIGHER (identity/downsample)
+    conditional_min_sample_rate: 22050   # [22050,24000): NEAR_TARGET_UPSAMPLE (conditional)
+    low_bandwidth_min_sample_rate: 16000 # [16000,22050): LOW_BANDWIDTH_SOURCE
+    allow_near_target_upsample: true     # 22.05 kHz allowed but marked non-native
+    reject_low_bandwidth_from_clean_hq: true   # 16 kHz rejected from strict HQ
+    reject_narrowband_from_clean_hq: true      # < 16 kHz (e.g. 8 kHz telephony) rejected

@@ -69,6 +69,7 @@ class PolicyEngine:
 
         checks["has_speech"] = self._has_speech(ev, reasons)
         checks["duration_ok"] = self._duration(ev, reasons)
+        checks["source_bandwidth_ok"] = self._source_bandwidth(ev, reasons)
         checks["no_clipping"] = self._no_clipping(ev, reasons)
         checks["no_confirmed_music_overlap"] = self._music(ev, avail, reasons)
         checks["no_severe_noise_overlap"] = self._noise_overlap(ev, reasons)
@@ -103,6 +104,19 @@ class PolicyEngine:
         if dur > self.config.max_duration_s:
             reasons.append(f"DURATION_TOO_LONG:{dur:.2f}s>{self.config.max_duration_s:.1f}s")
             return FAIL
+        return PASS
+
+    def _source_bandwidth(self, ev, reasons) -> str:
+        # A source whose measured bandwidth is narrow relative to the 24 kHz
+        # target (likely an upsampled low-bandwidth source) must not silently
+        # enter strict clean HQ. There is no validated hard bandwidth threshold,
+        # so a suspected case is routed to REVIEW (UNKNOWN), never a fabricated
+        # PASS or REJECT (spec §Effective bandwidth logic).
+        if ev.low_bandwidth_suspected:
+            eff = ev.effective_bandwidth_hz
+            reasons.append("SUSPECTED_UPSAMPLED_SOURCE" +
+                           (f":eff_bw={eff:.0f}Hz" if eff is not None else ""))
+            return UNKNOWN
         return PASS
 
     def _no_clipping(self, ev, reasons) -> str:

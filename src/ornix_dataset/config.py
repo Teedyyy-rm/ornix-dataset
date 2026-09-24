@@ -10,6 +10,7 @@ import yaml
 
 from .curation.policy import PolicyConfig, load_policy
 from .detectors import DetectorKind, registry
+from .dsp.admission import AdmissionConfig
 from .dsp.technical import TechnicalThresholds
 from .ingestion.hf import HfSourceAdapter
 from .ingestion.local import LocalSourceAdapter
@@ -68,6 +69,14 @@ def technical_thresholds(audio_profile: Optional[str]) -> TechnicalThresholds:
     prof = load_yaml(audio_profile).get("technical_thresholds", {})
     known = TechnicalThresholds.__dataclass_fields__.keys()
     return TechnicalThresholds(**{k: v for k, v in prof.items() if k in known})
+
+
+def source_admission_config(audio_profile: Optional[str]) -> AdmissionConfig:
+    if not audio_profile or not os.path.exists(audio_profile):
+        return AdmissionConfig()
+    prof = load_yaml(audio_profile).get("source_admission", {}).get("clean_hq", {})
+    known = AdmissionConfig.__dataclass_fields__.keys()
+    return AdmissionConfig(**{k: v for k, v in prof.items() if k in known})
 
 
 @dataclass

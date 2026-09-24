@@ -20,10 +20,16 @@ class SourceRecord:
     source_bytes: int
     # measured / declared audio metadata
     source_mime: Optional[str] = None
+    source_container: Optional[str] = None
     source_codec: Optional[str] = None
+    source_lossy: Optional[bool] = None
     source_sample_rate: Optional[int] = None
     source_channels: Optional[int] = None
     source_duration_s: Optional[float] = None
+    # source-admission provenance (Level 1 — clean-HQ eligibility)
+    source_rate_class: Optional[str] = None
+    effective_bandwidth_hz: Optional[float] = None
+    low_bandwidth_suspected: bool = False
     # rights (spec §0.2.6 — gated != redistributable)
     source_license: str = "UNKNOWN"
     license_evidence_uri: Optional[str] = None

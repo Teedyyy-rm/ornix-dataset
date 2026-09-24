@@ -31,6 +31,17 @@ def test_t008_low_bandwidth_upsample_flagged(tmp_path):
     assert any("LOW_BANDWIDTH" in rc for rc in r.reason_codes)
 
 
+def test_t008_target_aware_highrate_speech_not_penalised(tmp_path):
+    # a 48 kHz source whose useful bandwidth (~10 kHz) exceeds the 24 kHz target
+    # Nyquist (12 kHz) must NOT be flagged: reasoning is relative to
+    # min(source_nyquist, canonical_nyquist), not blindly source_sr/2.
+    sig = synth.upsampled_lowband(48000, 2.0, src_sr=20000)  # band-limited to ~10 kHz
+    p = _wav(tmp_path, "hr.wav", sig, 48000)
+    r = run_technical_validation(p)
+    assert not r.low_bandwidth_suspected
+    assert not any("LOW_BANDWIDTH" in rc for rc in r.reason_codes)
+
+
 def test_t010_nan_rejected(tmp_path):
     sig = synth.speechlike(24000, 1.0)
     sig[100:110] = np.nan

@@ -138,3 +138,26 @@ def test_determinism():
 def test_quality_unavailable_review():
     d = _engine().decide(_ev(), _src(), {"music": True, "quality": False, "speaker": True})
     assert d.decision == DecisionState.REVIEW
+
+
+def test_source_bandwidth_suspected_upsample_routes_to_review():
+    # a source flagged as likely upsampled/low-bandwidth must not silently ACCEPT;
+    # with source_bandwidth_ok required, it becomes REVIEW (UNKNOWN), never PASS.
+    cfg = PolicyConfig(policy_version="v1",
+                       required_checks=PUBLIC_REQUIRED + ["source_bandwidth_ok"],
+                       single_speaker_required=True)
+    eng = PolicyEngine(cfg)
+    ev = _ev(low_bandwidth_suspected=True, effective_bandwidth_hz=4000.0)
+    d = eng.decide(ev, _src(), ALL_AVAIL)
+    assert d.decision == DecisionState.REVIEW
+    assert any("SUSPECTED_UPSAMPLED_SOURCE" in r for r in d.reason_codes)
+
+
+def test_source_bandwidth_ok_passes_for_full_band_source():
+    cfg = PolicyConfig(policy_version="v1",
+                       required_checks=PUBLIC_REQUIRED + ["source_bandwidth_ok"],
+                       single_speaker_required=True)
+    eng = PolicyEngine(cfg)
+    d = eng.decide(_ev(low_bandwidth_suspected=False), _src(), ALL_AVAIL)
+    assert d.decision == DecisionState.ACCEPT
+    assert d.observed_checks["source_bandwidth_ok"] == "PASS"
