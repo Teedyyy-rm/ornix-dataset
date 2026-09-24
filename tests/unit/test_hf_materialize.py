@@ -74,6 +74,28 @@ def test_materialize_binds_sha_when_remote_unverified(tmp_path, monkeypatch):
     assert rec.source_sha256 == true_sha
 
 
+def test_materialize_patches_probe_provenance(tmp_path, monkeypatch):
+    # after staging, the record carries preliminary codec/container/rate-class
+    # from an ffprobe of the staged bytes (same fields LocalSourceAdapter fills).
+    blob = tmp_path / "downloaded.wav"
+    synth.write_wav(str(blob), synth.speechlike(24000, 1.0, seed=4), 24000)
+    true_sha = sha256_file(str(blob))
+
+    import huggingface_hub
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download",
+                        lambda **kw: str(blob))
+
+    rec = _record(true_sha)
+    assert rec.source_codec is None and rec.source_rate_class is None
+    _adapter().materialize(rec, str(tmp_path / "staging"))
+    assert rec.source_codec == "pcm_s16le"
+    assert rec.source_lossy is False
+    assert rec.source_container is not None
+    assert rec.source_sample_rate == 24000
+    assert rec.source_channels == 1
+    assert rec.source_rate_class == "NATIVE_OR_HIGHER"
+
+
 def test_analyze_source_emits_error_when_staged_path_missing(tmp_path):
     # a record that claims INGESTED but has no staged bytes must NOT be silently
     # dropped — the pipeline emits an ERROR evidence (no hidden skip, no-loss).

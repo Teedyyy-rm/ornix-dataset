@@ -13,6 +13,8 @@ from typing import Any, Dict, Iterator, List, Optional
 
 from ..contracts.enums import IngestStatus, RightsStatus
 from ..contracts.source import SourceRecord
+from ..dsp.admission import AdmissionConfig, _rate_class, classify_lossy
+from ..dsp.decode import DecodeError, ffprobe_info
 from ..util.hashing import sha256_file, short_id
 from ..util.timeutil import utc_now_iso
 from .base import SourceAdapter
@@ -102,6 +104,12 @@ class HfSourceAdapter(SourceAdapter):
         verified LFS blob sha256, the downloaded bytes MUST match it or we raise
         (fail-closed — never stage unverified content). Returns the staged path
         and sets it read-only (0o444) so the byte-exact provenance is immutable.
+
+        After staging, the staged bytes are probed (ffprobe, no decode) and the
+        record's preliminary codec/container/rate-class provenance is patched —
+        same preliminary fields ``LocalSourceAdapter`` fills at scan time
+        (authoritative admission still uses the *measured* rate at analyze time).
+        A probe failure is recorded, never fatal: the staged bytes are valid.
         """
         try:
             from huggingface_hub import hf_hub_download
@@ -128,4 +136,24 @@ class HfSourceAdapter(SourceAdapter):
             shutil.copyfile(local, staged)
             os.chmod(staged, 0o444)  # immutable staging
         record.staged_path = staged
+        self._patch_probe_provenance(record, staged)
         return staged
+
+    @staticmethod
+    def _patch_probe_provenance(record: SourceRecord, staged_path: str) -> None:
+        """Fill preliminary codec/container/rate-class from an ffprobe of staged bytes."""
+        try:
+            info = ffprobe_info(staged_path)
+        except DecodeError as e:
+            record.reason_codes = list(record.reason_codes) + [f"PROBE_FAILED:{e}"]
+            return
+        codec = info.get("codec_name")
+        declared_sr = info.get("sample_rate")
+        record.source_container = info.get("format_name")
+        record.source_codec = codec
+        record.source_lossy = classify_lossy(codec)
+        record.source_sample_rate = declared_sr
+        record.source_channels = info.get("channels")
+        record.source_duration_s = info.get("duration_s")
+        record.source_rate_class = (_rate_class(declared_sr, AdmissionConfig()).value
+                                    if declared_sr else None)
