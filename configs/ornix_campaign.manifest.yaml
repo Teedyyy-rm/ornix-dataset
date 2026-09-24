@@ -1,0 +1,148 @@
+# Ornix multi-dataset campaign manifest (driver: scripts/run_ornix_campaign.py).
+#
+# Full-scale, streaming curation of 14 Vietnamese speech datasets into ONE unified
+# canonical tree, then a gated publish to the destination repo.
+#
+# Rights are OPERATOR-DECLARED here, never inferred by the tool:
+#  - Datasets carrying a public license (MIT / CC-BY / CC-BY-SA / CC-BY-NC*) are
+#    declared REDISTRIBUTION_APPROVED with the commercial flag matching the license
+#    (NC => commercial "false").
+#  - Datasets with NO license on the Hub are declared REDISTRIBUTION_APPROVED on the
+#    operator's explicit assertion of redistribution rights (recorded 2026-09-25),
+#    conservatively marked commercial "false" and license "UNSPECIFIED-OPERATOR-DECLARED".
+#
+# speaker.mode:
+#   fixed  -> every clip of this source shares one speaker id (ref below)
+#   column -> per-row speaker taken from the dataset's `speaker` column
+#   none   -> no speaker ref (each clip becomes its own anonymous speaker)
+
+destination:
+  repo_id: Teedyyy-rm/Ornix-Datasets
+  repo_type: dataset
+
+defaults:
+  language: vi
+  audio_col: audio
+  chunk_rows: 4000          # clips extracted + QC'd per chunk before cleanup
+  min_free_gib: 25          # stop-safe: pause a dataset if free disk drops below this
+
+datasets:
+  - name: thanhpahm_tts
+    repo: toandev/ThanhPahm-TTS
+    format: parquet
+    parquet_prefix: data
+    text_col: transcription
+    speaker: {mode: fixed, ref: thanh_pham}
+    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: CC-BY-NC-SA-4.0, note: "ThanhPahm-TTS CC-BY-NC-SA-4.0; attribution + NC + share-alike"}
+
+  - name: ngochuyen_vivoice
+    repo: thangnzt/NgocHuyenViVoice
+    format: parquet
+    parquet_prefix: data
+    text_col: text
+    speaker: {mode: fixed, ref: ngoc_huyen_vivoice}
+    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "true", license: MIT, note: "NgocHuyenViVoice MIT"}
+
+  - name: ngochuyen_voice
+    repo: pnnbao-ump/ngochuyen_voice
+    format: parquet
+    parquet_prefix: data
+    text_col: transcription
+    speaker: {mode: fixed, ref: ngoc_huyen_voice}
+    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: CC-BY-NC-4.0, note: "ngochuyen_voice CC-BY-NC-4.0; NC"}
+
+  - name: vietbiblevox
+    repo: ntt123/VietBibleVox-aligned
+    format: parquet
+    parquet_prefix: ""        # shards are part_000.parquet at repo root
+    text_col: text
+    speaker: {mode: fixed, ref: thanh_nam}
+    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "true", license: CC-BY-SA-4.0, note: "VietBibleVox-aligned CC-BY-SA-4.0; share-alike"}
+
+  - name: fpt_fosd
+    repo: doof-ferb/fpt_fosd
+    format: parquet
+    parquet_prefix: data
+    text_col: transcription
+    speaker: {mode: none}
+    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "true", license: CC-BY-4.0, note: "FPT FOSD CC-BY-4.0"}
+  - name: hatrang_voice
+    repo: quocs/hatrang-voice-4h
+    format: loose
+    loose_audio_prefix: raw_audio/
+    loose_meta: raw_audio/metadata.jsonl        # {file_name, transcription}
+    loose_meta_kind: jsonl
+    text_col: transcription
+    file_col: file_name
+    speaker: {mode: fixed, ref: ha_trang}
+    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: UNSPECIFIED-OPERATOR-DECLARED, note: "no Hub license; operator asserts redistribution rights 2026-09-25"}
+
+  - name: luna_vi
+    repo: TuNguyen1101/luna_vi
+    format: loose
+    loose_audio_prefix: data/
+    loose_meta: metadata.csv                     # file_name,text,language,index
+    loose_meta_kind: csv
+    text_col: text
+    file_col: file_name
+    speaker: {mode: fixed, ref: luna}
+    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: UNSPECIFIED-OPERATOR-DECLARED, note: "no Hub license; operator asserts redistribution rights 2026-09-25"}
+
+  - name: vi_voice_female
+    repo: vuihocrnd/vi_voice_female
+    format: parquet
+    parquet_prefix: data
+    text_col: text
+    speaker: {mode: fixed, ref: hong_hanh}
+    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: UNSPECIFIED-OPERATOR-DECLARED, note: "no Hub license; operator asserts redistribution rights 2026-09-25"}
+
+  - name: w2wmovie_voice2
+    repo: thanghp456/W2WMovie-Voice-2
+    format: parquet
+    parquet_prefix: data
+    text_col: text
+    speaker: {mode: fixed, ref: hong_ngan}
+    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "true", license: MIT, note: "W2WMovie-Voice-2 MIT"}
+
+  - name: vieneu_tts_140h
+    repo: pnnbao-ump/VieNeu-TTS-140h
+    format: arrow
+    text_col: text
+    speaker: {mode: column, col: speaker}
+    gated: true
+    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: CC-BY-NC-4.0, note: "VieNeu-TTS-140h CC-BY-NC-4.0; NC; gated access"}
+
+  - name: vi1000h
+    repo: bonelag/vi1000h
+    format: parquet
+    parquet_prefix: data
+    text_col: text
+    speaker: {mode: none}         # dataset has voice_id but operator: treat as none
+    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: UNSPECIFIED-OPERATOR-DECLARED, note: "no Hub license; operator asserts redistribution rights 2026-09-25"}
+
+  - name: dolly_audio_1000h
+    repo: dolly-vn/dolly-audio-1000h-vietnamese
+    format: parquet
+    parquet_prefix: data
+    text_col: text
+    speaker: {mode: none}
+    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: UNSPECIFIED-OPERATOR-DECLARED, note: "no Hub license; operator asserts redistribution rights 2026-09-25"}
+
+  - name: phoaudiobook
+    repo: thivux/phoaudiobook
+    format: parquet
+    parquet_prefix: data
+    text_col: text
+    speaker: {mode: column, col: speaker}      # speaker names already present
+    gated: true
+    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: UNSPECIFIED-OPERATOR-DECLARED, note: "no Hub license; gated; operator asserts redistribution rights 2026-09-25"}
+
+  - name: vivoice
+    repo: capleaf/viVoice
+    format: parquet
+    parquet_prefix: data
+    text_col: text
+    speaker: {mode: none}
+    gated: true
+    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: CC-BY-NC-SA-4.0, note: "viVoice CC-BY-NC-SA-4.0; NC + share-alike; gated access"}
+

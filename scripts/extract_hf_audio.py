@@ -1,34 +1,38 @@
-"""Extract a subset of an HF *parquet-embedded audio* dataset into a local corpus.
+"""Extract a page of an HF audio dataset into a local corpus (loose files + metadata.jsonl).
 
-Most HF audio datasets store audio bytes INSIDE parquet shards (column
-``audio: {bytes, path}``), not as loose files — so the read-only HfSourceAdapter
-(which enumerates loose audio files) cannot see them. This helper streams a
-bounded number of row groups (range reads; it does NOT download whole shards),
-writes each clip's original bytes to disk, and emits a metadata.jsonl the
-LocalSourceAdapter understands. Rights are declared by the operator, not guessed.
+Normalizes THREE on-Hub layouts into the same local shape the LocalSourceAdapter
+understands, so the standard ingest/qc/canonical path can consume any of them:
 
-Usage:
-    python scripts/extract_hf_audio.py --repo doof-ferb/fpt_fosd \
-        --out work/fpt_fosd_sample --limit 150
+  * ``parquet`` — audio bytes embedded in parquet shards (column ``audio:{bytes,path}``)
+  * ``arrow``   — audio bytes embedded in HF ``datasets`` .arrow shards
+  * ``loose``   — loose audio files + a separate csv/jsonl transcript table
+
+It is PAGED and resumable: a call processes a bounded slice (by row-group / batch /
+file cursor) and prints a machine-readable ``RESULT {json}`` line with the next
+cursor and whether the source is exhausted. The orchestrator advances the cursor,
+running each page through QC and deleting it before fetching the next (disk-bounded).
+
+Rights are declared by the operator downstream, never guessed here.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import sys
 
-# Loose-file ingestion (LocalSourceAdapter) keys off the file extension, but HF
-# parquet audio commonly stores ``path: null`` — so the original container has to
-# be recovered from the leading magic bytes, else the extracted clips land with
-# no extension and are silently skipped at ingest.
+# Loose-file ingestion keys off the extension, but HF parquet audio commonly stores
+# ``path: null`` — recover the container from the leading magic bytes so extracted
+# clips are not silently skipped at ingest.
 _MAGIC_EXTS = (
     (b"RIFF", ".wav"),      # WAV (RIFF/WAVE)
     (b"fLaC", ".flac"),     # FLAC
     (b"OggS", ".ogg"),      # Ogg (Vorbis/Opus)
     (b"ID3", ".mp3"),       # MP3 with ID3 tag
 )
+_AUDIO_EXTS = {".wav", ".flac", ".mp3", ".ogg", ".opus", ".m4a", ".aac", ".wv"}
 
 
 def _sniff_ext(b: bytes) -> str:
@@ -49,73 +53,258 @@ def _named(path_field, blob: bytes, index: int) -> str:
     """Filename with a real audio extension, recovered from bytes when needed."""
     base = os.path.basename(path_field) if path_field else ""
     root, ext = os.path.splitext(base)
-    if ext.lower() in {".wav", ".flac", ".mp3", ".ogg", ".opus", ".m4a", ".aac"}:
+    if ext.lower() in _AUDIO_EXTS:
         return base
     stem = root or base or f"clip_{index:06d}"
     return stem + _sniff_ext(blob)
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--repo", required=True)
-    ap.add_argument("--config-dir", default="data", help="dir in repo holding parquet shards")
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--limit", type=int, default=150)
-    ap.add_argument("--audio-col", default="audio")
-    ap.add_argument("--text-col", default="transcription")
-    ap.add_argument("--language", default="vi")
-    args = ap.parse_args(argv)
+def _meta_row(name, text, lang, speaker_ref):
+    row = {"file": name, "source_transcript": text, "source_language": lang}
+    if speaker_ref:
+        row["source_speaker_ref"] = speaker_ref
+    return row
 
-    import pyarrow.parquet as pq
-    from huggingface_hub import HfApi, HfFileSystem
 
-    api = HfApi()
-    info = api.dataset_info(args.repo, revision="main")
-    sha = info.sha
-    shards = sorted(s.rfilename for s in (info.siblings or [])
-                    if s.rfilename.endswith(".parquet") and s.rfilename.startswith(args.config_dir))
-    if not shards:
-        print(f"[FAIL] no parquet shards under {args.config_dir}/ in {args.repo}", file=sys.stderr)
-        return 1
-
-    os.makedirs(args.out, exist_ok=True)
-    fs = HfFileSystem()
-    meta = []
-    written = 0
-    for shard in shards:
-        if written >= args.limit:
-            break
-        pf = pq.ParquetFile(fs.open(f"datasets/{args.repo}/{shard}", "rb"))
-        for rg in range(pf.num_row_groups):
-            if written >= args.limit:
-                break
-            tbl = pf.read_row_group(rg, columns=[args.audio_col, args.text_col])
-            audio = tbl.column(args.audio_col).to_pylist()
-            text = tbl.column(args.text_col).to_pylist()
-            for a, t in zip(audio, text):
-                if written >= args.limit:
-                    break
-                b = a.get("bytes")
-                if not b:
-                    continue
-                name = _named(a.get("path"), b, written)
-                dst = os.path.join(args.out, name)
-                with open(dst, "wb") as fh:
-                    fh.write(b)
-                meta.append({"file": name, "source_transcript": t,
-                             "source_language": args.language})
-                written += 1
-
-    mpath = os.path.join(args.out, "metadata.jsonl")
+def _write_meta(out, meta):
+    mpath = os.path.join(out, "metadata.jsonl")
     with open(mpath, "w", encoding="utf-8") as fh:
         for m in meta:
             fh.write(json.dumps(m, ensure_ascii=False) + "\n")
-    print(f"[ok] repo={args.repo}@{sha[:12]} wrote {written} clips -> {args.out}")
-    print(f"     metadata: {mpath}")
-    print("     NOTE: declare rights explicitly in your sources.yaml (do not assume "
-          "'public' == redistributable).")
+    return mpath
+
+
+def _speaker_for_row(args, row_speaker):
+    if args.speaker_ref:
+        return args.speaker_ref
+    if args.speaker_col and row_speaker:
+        return f"{args.speaker_col}:{row_speaker}"
+    return None
+
+
+def _uniq_name(rel_path, blob, index):
+    """Flatten a repo-relative path to a unique local filename with a real ext."""
+    flat = rel_path.replace("/", "__")
+    root, ext = os.path.splitext(flat)
+    if ext.lower() in _AUDIO_EXTS:
+        return flat
+    return (root or f"clip_{index:06d}") + _sniff_ext(blob)
+
+
+def extract_parquet(args, api, fs):
+    import pyarrow.parquet as pq
+    info = api.dataset_info(args.repo, revision="main")
+    prefix = args.config_dir or ""
+    shards = sorted(s.rfilename for s in (info.siblings or [])
+                    if s.rfilename.endswith(".parquet")
+                    and (prefix == "" or s.rfilename.startswith(prefix)))
+    if not shards:
+        # fall back to any parquet anywhere in the repo
+        shards = sorted(s.rfilename for s in (info.siblings or [])
+                        if s.rfilename.endswith(".parquet"))
+    if not shards:
+        raise SystemExit(f"[FAIL] no parquet shards in {args.repo}")
+
+    os.makedirs(args.out, exist_ok=True)
+    meta = []
+    written = 0
+    si, rgi = args.start_shard, args.start_rg
+    next_shard, next_rg, exhausted = si, rgi, True
+    while si < len(shards):
+        pf = pq.ParquetFile(fs.open(f"datasets/{args.repo}/{shards[si]}", "rb"))
+        ng = pf.num_row_groups
+        rg = rgi
+        while rg < ng:
+            if written >= args.limit:
+                next_shard, next_rg, exhausted = si, rg, False
+                _write_meta(args.out, meta)
+                return {"written": written, "next_shard": next_shard,
+                        "next_rg": next_rg, "exhausted": exhausted, "sha": info.sha[:12]}
+            cols = [args.audio_col, args.text_col]
+            if args.speaker_col:
+                cols.append(args.speaker_col)
+            tbl = pf.read_row_group(rg, columns=cols)
+            audio = tbl.column(args.audio_col).to_pylist()
+            text = tbl.column(args.text_col).to_pylist()
+            spk = tbl.column(args.speaker_col).to_pylist() if args.speaker_col else [None] * len(audio)
+            for a, t, s in zip(audio, text, spk):
+                b = a.get("bytes") if a else None
+                if not b:
+                    continue
+                name = _named(a.get("path"), b, written)
+                with open(os.path.join(args.out, name), "wb") as fh:
+                    fh.write(b)
+                meta.append(_meta_row(name, t, args.language, _speaker_for_row(args, s)))
+                written += 1
+            rg += 1
+        si += 1
+        rgi = 0
+    _write_meta(args.out, meta)
+    return {"written": written, "next_shard": si, "next_rg": 0,
+            "exhausted": True, "sha": info.sha[:12]}
+
+
+def extract_arrow(args, api, fs):
+    import pyarrow as pa
+    info = api.dataset_info(args.repo, revision="main")
+    shards = sorted(s.rfilename for s in (info.siblings or [])
+                    if s.rfilename.endswith(".arrow"))
+    if not shards:
+        raise SystemExit(f"[FAIL] no .arrow shards in {args.repo}")
+    os.makedirs(args.out, exist_ok=True)
+    meta = []
+    written = 0
+    si, bi = args.start_shard, args.start_rg
+    while si < len(shards):
+        with fs.open(f"datasets/{args.repo}/{shards[si]}", "rb") as fh:
+            try:
+                reader = pa.ipc.open_stream(fh)
+            except pa.lib.ArrowInvalid:
+                fh.seek(0)
+                reader = pa.ipc.open_file(fh)
+            batches = (reader.read_all().to_batches() if hasattr(reader, "read_all")
+                       else [reader.get_batch(i) for i in range(reader.num_record_batches)]) \
+                if hasattr(reader, "num_record_batches") else None
+            b_idx = 0
+            it = iter(batches) if batches is not None else iter(reader)
+            for batch in it:
+                if b_idx < bi:
+                    b_idx += 1
+                    continue
+                if written >= args.limit:
+                    _write_meta(args.out, meta)
+                    return {"written": written, "next_shard": si, "next_rg": b_idx,
+                            "exhausted": False, "sha": info.sha[:12]}
+                d = batch.to_pydict()
+                audio = d.get(args.audio_col, [])
+                text = d.get(args.text_col, [None] * len(audio))
+                spk = d.get(args.speaker_col, [None] * len(audio)) if args.speaker_col \
+                    else [None] * len(audio)
+                for a, t, s in zip(audio, text, spk):
+                    blob = a.get("bytes") if a else None
+                    if not blob:
+                        continue
+                    name = _named(a.get("path"), blob, written)
+                    with open(os.path.join(args.out, name), "wb") as w:
+                        w.write(blob)
+                    meta.append(_meta_row(name, t, args.language, _speaker_for_row(args, s)))
+                    written += 1
+                b_idx += 1
+        si += 1
+        bi = 0
+    _write_meta(args.out, meta)
+    return {"written": written, "next_shard": si, "next_rg": 0,
+            "exhausted": True, "sha": info.sha[:12]}
+
+
+def _load_loose_meta(args):
+    """Build {repo_relpath|basename -> transcript} from a csv/jsonl table."""
+    from huggingface_hub import hf_hub_download
+    if not args.loose_meta:
+        return {}
+    path = hf_hub_download(args.repo, args.loose_meta, repo_type="dataset")
+    fmap = {}
+
+    def put(fn, txt):
+        if not fn:
+            return
+        fmap[fn] = txt
+        fmap[os.path.basename(fn)] = txt
+
+    if args.loose_meta_kind == "jsonl":
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                r = json.loads(line)
+                put(r.get(args.file_col), r.get(args.text_col))
+    else:  # csv (sniff pipe vs comma; header optional)
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            sample = fh.readline()
+            fh.seek(0)
+            if "|" in sample and "," not in sample.split("|")[0]:
+                for line in fh:
+                    parts = line.rstrip("\n").split("|", 1)
+                    if len(parts) == 2:
+                        put(parts[0], parts[1])
+            else:
+                for r in csv.DictReader(fh):
+                    put(r.get(args.file_col), r.get(args.text_col))
+    return fmap
+
+
+def extract_loose(args, api, fs):
+    from huggingface_hub import hf_hub_download
+    info = api.dataset_info(args.repo, revision="main")
+    pfx = args.loose_audio_prefix or ""
+    files = sorted(s.rfilename for s in (info.siblings or [])
+                   if os.path.splitext(s.rfilename)[1].lower() in _AUDIO_EXTS
+                   and s.rfilename.startswith(pfx))
+    if not files:
+        raise SystemExit(f"[FAIL] no loose audio under {pfx!r} in {args.repo}")
+    fmap = _load_loose_meta(args)
+    os.makedirs(args.out, exist_ok=True)
+    meta = []
+    written = 0
+    i = args.start_shard
+    while i < len(files) and written < args.limit:
+        rel = files[i]
+        src = hf_hub_download(args.repo, rel, repo_type="dataset")
+        with open(src, "rb") as fh:
+            blob = fh.read()
+        name = _uniq_name(rel, blob, i)
+        with open(os.path.join(args.out, name), "wb") as w:
+            w.write(blob)
+        txt = fmap.get(rel) or fmap.get(os.path.basename(rel))
+        meta.append(_meta_row(name, txt, args.language, args.speaker_ref))
+        written += 1
+        i += 1
+    _write_meta(args.out, meta)
+    return {"written": written, "next_shard": i, "next_rg": 0,
+            "exhausted": i >= len(files), "sha": info.sha[:12]}
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--repo", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--format", choices=["parquet", "arrow", "loose"], default="parquet")
+    ap.add_argument("--limit", type=int, default=0, help="max clips this call (0 = no cap)")
+    ap.add_argument("--start-shard", type=int, default=0, help="resume cursor: shard/file index")
+    ap.add_argument("--start-rg", type=int, default=0, help="resume cursor: row-group/batch index")
+    ap.add_argument("--audio-col", default="audio")
+    ap.add_argument("--text-col", default="transcription")
+    ap.add_argument("--language", default="vi")
+    ap.add_argument("--config-dir", default="data", help="parquet shard prefix ('' = all parquet)")
+    ap.add_argument("--speaker-ref", default=None, help="fixed speaker ref for every clip")
+    ap.add_argument("--speaker-col", default=None, help="per-row speaker column name")
+    ap.add_argument("--loose-audio-prefix", default="")
+    ap.add_argument("--loose-meta", default=None)
+    ap.add_argument("--loose-meta-kind", choices=["csv", "jsonl"], default="csv")
+    ap.add_argument("--file-col", default="file_name")
+    args = ap.parse_args(argv)
+    if args.limit <= 0:
+        args.limit = 10 ** 12  # effectively unbounded
+
+    from huggingface_hub import HfApi, HfFileSystem
+    token = os.environ.get("HF_TOKEN")
+    api = HfApi(token=token)
+    fs = HfFileSystem(token=token)
+
+    if args.format == "parquet":
+        res = extract_parquet(args, api, fs)
+    elif args.format == "arrow":
+        res = extract_arrow(args, api, fs)
+    else:
+        res = extract_loose(args, api, fs)
+
+    print(f"[ok] repo={args.repo}@{res['sha']} format={args.format} "
+          f"wrote {res['written']} clips -> {args.out} (exhausted={res['exhausted']})")
+    print("     NOTE: rights are declared by the operator downstream; not inferred here.")
+    print("RESULT " + json.dumps(res))
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
+
