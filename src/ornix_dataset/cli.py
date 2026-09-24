@@ -364,6 +364,68 @@ def cmd_campaign_download(args) -> int:
     return 0 if rep.get("ok") else 3
 
 
+def cmd_campaign_qc(args) -> int:
+    from .campaign import CampaignStore, run_qc_batch
+
+    store = CampaignStore(args.root)
+    try:
+        store.load_job(args.job)
+        store.load_batch(args.batch)
+    except FileNotFoundError as e:
+        _print({"error": f"unknown campaign/job/batch: {e}"})
+        return 2
+    pipe = _build_pipeline(args)
+    rep = run_qc_batch(store, args.job, args.batch,
+                       lambda src, paths, audit: pipe.analyze_source(
+                           src, paths, audit),
+                       workdir=args.qc_workdir)
+    _print(rep)
+    return 0 if rep.get("ok") else 3
+
+
+def cmd_campaign_gate(args) -> int:
+    from .campaign import CampaignStore, gate_batch_release
+
+    store = CampaignStore(args.root)
+    try:
+        rep = gate_batch_release(store, args.job, args.batch)
+    except FileNotFoundError as e:
+        _print({"error": f"unknown campaign/job/batch: {e}"})
+        return 2
+    _print(rep)
+    return 0 if rep.get("ok") else 3
+
+
+def cmd_campaign_release(args) -> int:
+    from .campaign import CampaignStore, prepare_release
+
+    store = CampaignStore(args.root)
+    try:
+        rep = prepare_release(store, args.job, args.batch,
+                              release_target=args.target,
+                              export_format=args.format)
+    except FileNotFoundError as e:
+        _print({"error": f"unknown campaign/job/batch: {e}"})
+        return 2
+    _print(rep)
+    return 0 if rep.get("ok") else 3
+
+
+def cmd_campaign_publish(args) -> int:
+    from .campaign import CampaignStore, publish_release
+
+    store = CampaignStore(args.root)
+    try:
+        rep = publish_release(store, args.release, args.repo,
+                              args.approval, full_hash=args.full_hash,
+                              upload_retries=args.upload_retries)
+    except FileNotFoundError as e:
+        _print({"error": f"unknown release: {e}"})
+        return 2
+    _print(rep)
+    return 0 if rep.get("ok") else 3
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ornix-dataset",
                                 description="Ornix dataset quality & curation (fail-closed)")
@@ -491,6 +553,38 @@ def build_parser() -> argparse.ArgumentParser:
     cd.add_argument("--workers", type=int, default=4)
     cd.add_argument("--min-free", type=int, default=None)
     cd.set_defaults(func=cmd_campaign_download)
+    cq = cpsub.add_parser("qc", help="run audio QC over a downloaded batch")
+    cq.add_argument("--root", required=True)
+    cq.add_argument("--job", required=True)
+    cq.add_argument("--batch", required=True)
+    cq.add_argument("--policy", required=True)
+    cq.add_argument("--models-lock", default=None)
+    cq.add_argument("--audio-profile", default=None)
+    cq.add_argument("--qc-workdir", default=None)
+    wd(cq)
+    cq.set_defaults(func=cmd_campaign_qc)
+    cg = cpsub.add_parser("gate", help="job-global release gate for a batch")
+    cg.add_argument("--root", required=True)
+    cg.add_argument("--job", required=True)
+    cg.add_argument("--batch", required=True)
+    cg.set_defaults(func=cmd_campaign_gate)
+    cr_ = cpsub.add_parser("release", help="build a namespaced release dir")
+    cr_.add_argument("--root", required=True)
+    cr_.add_argument("--job", required=True)
+    cr_.add_argument("--batch", required=True)
+    cr_.add_argument("--target", choices=["train_only", "public"],
+                     default="train_only")
+    cr_.add_argument("--format", choices=["parquet", "webdataset", "none"],
+                     default="parquet")
+    cr_.set_defaults(func=cmd_campaign_release)
+    cpu = cpsub.add_parser("publish", help="upload a release + remote-verify")
+    cpu.add_argument("--root", required=True)
+    cpu.add_argument("--release", required=True)
+    cpu.add_argument("--repo", required=True)
+    cpu.add_argument("--approval", required=True)
+    cpu.add_argument("--full-hash", action="store_true")
+    cpu.add_argument("--upload-retries", type=int, default=3)
+    cpu.set_defaults(func=cmd_campaign_publish)
     return p
 
 
