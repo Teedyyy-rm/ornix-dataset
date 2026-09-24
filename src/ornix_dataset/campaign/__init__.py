@@ -15,15 +15,31 @@ from .refs import (
     normalize_repo_ref,
     pin_revision,
 )
+from .resources import (
+    STAGES,
+    BatchPlan,
+    Budget,
+    ReservationLedger,
+    StageProfile,
+    WatermarkGate,
+    plan_with_budget,
+    try_admit,
+)
 from .store import CampaignStore
 
 __all__ = [
+    "STAGES",
     "Batch",
+    "BatchPlan",
     "BatchStatus",
+    "Budget",
     "Campaign",
     "CampaignStore",
     "DatasetJob",
     "JobStatus",
+    "ReservationLedger",
+    "StageProfile",
+    "WatermarkGate",
     "batch_id_for",
     "canonical_repo_id",
     "default_resolver",
@@ -31,4 +47,6 @@ __all__ = [
     "normalize_repo_ref",
     "pin_revision",
     "plan_batches",
+    "plan_with_budget",
+    "try_admit",
 ]

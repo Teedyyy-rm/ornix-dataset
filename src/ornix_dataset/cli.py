@@ -263,6 +263,47 @@ def cmd_campaign_resume(args) -> int:
     return 0
 
 
+def cmd_campaign_plan(args) -> int:
+    from .campaign import Budget, CampaignStore, StageProfile
+    from .util.jsonl import read_jsonl
+
+    store = CampaignStore(args.root)
+    try:
+        campaign = store.load_campaign()
+    except FileNotFoundError:
+        _print({"error": f"no campaign in {store.root}"})
+        return 2
+    files = []
+    for rec in read_jsonl(args.inventory):
+        size = rec.get("size", rec.get("bytes"))
+        files.append((rec["path"], size if isinstance(size, int) else None))
+    if not files:
+        _print({"error": "empty inventory; refusing to plan zero batches"})
+        return 2
+    budget = Budget.from_workspace(
+        campaign.workspace, store.root,
+        max_bytes=args.max_batch_workspace, min_free_bytes=args.min_free,
+        max_files_per_batch=args.max_files,
+        max_batch_bytes=args.max_batch_bytes)
+    profile = StageProfile(
+        unknown_estimate_bytes=args.unknown_estimate,
+        max_unknown_per_batch=args.max_unknown)
+    try:
+        batches = store.plan_job_batches(args.job, files, budget=budget,
+                                         profile=profile)
+    except (ValueError, FileNotFoundError) as e:
+        _print({"error": str(e)})
+        return 2
+    blocked = [b.batch_id for b in batches if b.status == "BLOCKED"]
+    _print({"job": args.job, "n_batches": len(batches),
+            "n_blocked": len(blocked), "blocked": blocked,
+            "plan": [{"batch_id": b.batch_id, "index": b.index,
+                      "n_files": len(b.files),
+                      "accountable_bytes": b.reservation.get("accountable_bytes", 0),
+                      "status": b.status} for b in batches]})
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ornix-dataset",
                                 description="Ornix dataset quality & curation (fail-closed)")
@@ -362,6 +403,20 @@ def build_parser() -> argparse.ArgumentParser:
     cr.add_argument("--check-remote", action="store_true",
                     help="report upstream drift without changing pins")
     cr.set_defaults(func=cmd_campaign_resume)
+    cp_ = cpsub.add_parser("plan", help="resource-aware batch planning for a job")
+    cp_.add_argument("--root", required=True)
+    cp_.add_argument("--job", required=True)
+    cp_.add_argument("--inventory", required=True,
+                     help="JSONL with {path, size|null} per line")
+    cp_.add_argument("--max-files", type=int, default=None)
+    cp_.add_argument("--max-batch-bytes", type=int, default=None)
+    cp_.add_argument("--max-batch-workspace", type=int, default=None,
+                     help="cap on workspace bytes (default: campaign workspace)")
+    cp_.add_argument("--min-free", type=int, default=None)
+    cp_.add_argument("--unknown-estimate", type=int,
+                     default=512 * 1024**2)
+    cp_.add_argument("--max-unknown", type=int, default=50)
+    cp_.set_defaults(func=cmd_campaign_plan)
     return p
 
 

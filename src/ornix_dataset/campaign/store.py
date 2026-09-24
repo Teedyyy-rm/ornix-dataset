@@ -33,6 +33,7 @@ from .models import (
 )
 from .planning import plan_batches
 from .refs import normalize_repo_ref, pin_revision
+from .resources import Budget, StageProfile, plan_with_budget
 
 _CAMPAIGN_FILE = "campaign.json"
 _SAFE = re.compile(r"[^A-Za-z0-9_.-]")
@@ -201,17 +202,29 @@ class CampaignStore:
     def plan_job_batches(self, job_id: str,
                          files: List[Tuple[str, Optional[int]]],
                          max_files: int = 500,
-                         max_bytes: int = 10 * 1024**3) -> List[Batch]:
+                         max_bytes: int = 10 * 1024**3,
+                         budget: Optional["Budget"] = None,
+                         profile: Optional["StageProfile"] = None) -> List[Batch]:
         """Deterministically (re-)plan a pinned job's batches from a file list.
 
         Re-planning with the same file list yields the same batch_ids; the job
         record is updated atomically afterwards. Fail-closed on unpinned jobs.
+
+        With ``budget`` (MD-002), batches carry per-stage reservations and a
+        lone over-budget file becomes BLOCKED instead of silently passing.
+        Without it, the mechanical MD-001 split is used (empty reservations).
         """
         job = self.load_job(job_id)
         if not job.pinned_sha:
             raise ValueError(f"job {job_id} has no pinned revision; resolve it first")
-        batches = plan_batches(job.repo_id, job.pinned_sha, job.job_id, files,
-                               max_files=max_files, max_bytes=max_bytes)
+        if budget is not None:
+            plan = plan_with_budget(job.repo_id, job.pinned_sha, job.job_id,
+                                    files, budget, profile)
+            batches = plan.batches
+        else:
+            batches = plan_batches(job.repo_id, job.pinned_sha, job.job_id,
+                                   files, max_files=max_files,
+                                   max_bytes=max_bytes)
         for b in batches:
             if b.checkpoint_rel != os.path.join(
                     "checkpoints", b.job_id, f"{b.batch_id}.jsonl"):
