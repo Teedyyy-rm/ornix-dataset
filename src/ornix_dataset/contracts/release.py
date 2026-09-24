@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 @dataclass
@@ -32,6 +32,15 @@ class ReleaseRow:
     source_license: str = "UNKNOWN"
     rights_status: str = "UNKNOWN"
     redistribution_permitted: bool = False
+    # canonical-normalization provenance (spec §4/§5): which source identity this
+    # row came from (for stable id + speaker scoping) and whether transcript /
+    # language were actually verified. Additive; defaults are fail-closed.
+    source_uri: str = ""
+    source_revision: str = ""
+    original_file_id: str = ""
+    source_speaker_ref: Optional[str] = None
+    language_verified: bool = False
+    transcript_verified: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

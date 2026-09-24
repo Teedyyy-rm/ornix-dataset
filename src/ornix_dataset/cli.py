@@ -550,6 +550,72 @@ def cmd_campaign_pump(args) -> int:
     return 0
 
 
+def cmd_canonical_export(args) -> int:
+    from .canonical import export_run
+
+    rep = export_run(args.workdir, args.run_id, args.dataset, args.state,
+                     require_redistributable=not args.allow_train_only,
+                     changelog=args.changelog or "")
+    _print(rep)
+    return 0 if rep.get("n_rows", 0) > 0 or not rep.get("n_blocked") else 3
+
+
+def cmd_canonical_export_batch(args) -> int:
+    from .canonical import export_campaign_batch
+    from .campaign import CampaignStore
+
+    store = CampaignStore(args.root)
+    try:
+        store.load_job(args.job)
+        store.load_batch(args.batch)
+        rep = export_campaign_batch(
+            store, args.job, args.batch, args.dataset, args.state,
+            metadata_file=args.metadata,
+            require_redistributable=not args.allow_train_only,
+            changelog=args.changelog or "")
+    except FileNotFoundError as e:
+        _print({"error": f"unknown campaign/job/batch: {e}"})
+        return 2
+    _print(rep)
+    return 0
+
+
+def cmd_canonical_verify(args) -> int:
+    from .canonical import verify_canonical_dataset
+
+    res = verify_canonical_dataset(args.dataset,
+                                   require_manifest=not args.no_manifest)
+    _print(res.to_dict())
+    return 0 if res.ok else 3
+
+
+def cmd_canonical_finalize(args) -> int:
+    from .canonical import finalize_dataset
+
+    rep = finalize_dataset(args.dataset)
+    _print(rep)
+    return 0 if rep.get("ok") else 3
+
+
+def cmd_canonical_publish(args) -> int:
+    from .canonical import publish_dataset
+
+    rep = publish_dataset(args.dataset, args.repo_id, args.approval,
+                          dry_run=args.dry_run, full_hash=args.full_hash,
+                          staging_revision=args.revision)
+    _print(rep)
+    return 0 if rep.get("status") in ("DRY_RUN", "PUBLISHED_VERIFIED") else 3
+
+
+def cmd_canonical_load(args) -> int:
+    from .canonical import load_ornix_dataset, split_stats
+
+    rows = load_ornix_dataset(args.dataset)
+    _print({"n_rows": len(rows), "stats": split_stats(args.dataset),
+            "sample": rows[0] if rows else None})
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ornix-dataset",
                                 description="Ornix dataset quality & curation (fail-closed)")
@@ -739,6 +805,50 @@ def build_parser() -> argparse.ArgumentParser:
     crep.add_argument("--dry-run", action="store_true",
                       help="read-only next-action preview; mutates nothing")
     crep.set_defaults(func=cmd_campaign_report)
+
+    cn = sub.add_parser("canonical", help="unified Ornix Dataset normalization")
+    cnsub = cn.add_subparsers(dest="sub", required=True)
+    ce = cnsub.add_parser("export", help="normalize a local run into the dataset")
+    ce.add_argument("--run-id", required=True)
+    ce.add_argument("--dataset", required=True, help="public HF tree (output)")
+    ce.add_argument("--state", required=True, help="private identity/provenance dir")
+    ce.add_argument("--allow-train-only", action="store_true",
+                    help="allow TRAIN_ONLY rows (default: public, redistributable only)")
+    ce.add_argument("--changelog", default=None)
+    wd(ce)
+    ce.set_defaults(func=cmd_canonical_export)
+    ceb = cnsub.add_parser("export-batch",
+                           help="normalize one campaign batch into the dataset")
+    ceb.add_argument("--root", required=True)
+    ceb.add_argument("--job", required=True)
+    ceb.add_argument("--batch", required=True)
+    ceb.add_argument("--dataset", required=True)
+    ceb.add_argument("--state", required=True)
+    ceb.add_argument("--metadata", default=None,
+                     help="optional JSONL sidecar keyed by original_file_id")
+    ceb.add_argument("--allow-train-only", action="store_true")
+    ceb.add_argument("--changelog", default=None)
+    ceb.set_defaults(func=cmd_canonical_export_batch)
+    cv = cnsub.add_parser("verify", help="offline integrity check of the dataset")
+    cv.add_argument("--dataset", required=True)
+    cv.add_argument("--no-manifest", action="store_true")
+    cv.set_defaults(func=cmd_canonical_verify)
+    cfi = cnsub.add_parser("finalize", help="write card + manifest + READY")
+    cfi.add_argument("--dataset", required=True)
+    cfi.set_defaults(func=cmd_canonical_finalize)
+    cpub = cnsub.add_parser("publish", help="publish the dataset (dry-run default)")
+    cpub.add_argument("--dataset", required=True)
+    cpub.add_argument("--repo-id", required=True)
+    cpub.add_argument("--approval", required=True)
+    cpub.add_argument("--revision", default="main")
+    cpub.add_argument("--full-hash", action="store_true")
+    grp = cpub.add_mutually_exclusive_group()
+    grp.add_argument("--dry-run", dest="dry_run", action="store_true", default=True)
+    grp.add_argument("--execute", dest="dry_run", action="store_false")
+    cpub.set_defaults(func=cmd_canonical_publish)
+    cl = cnsub.add_parser("load", help="load the dataset via the canonical loader")
+    cl.add_argument("--dataset", required=True)
+    cl.set_defaults(func=cmd_canonical_load)
     return p
 
 

@@ -36,6 +36,7 @@ adapters report `UNAVAILABLE` and the affected gates stay `UNKNOWN` (fail-closed
 | 6 | Release build, exporters, dataset card, verify | `exporters/` |
 | 7 | HF staged publisher (approval-gated) | `publishing/` |
 | 8 | Cache, checkpoint, queue, retention | `ops/` |
+| — | Unified canonical output (6-field metadata, opaque filenames, speakers) | `canonical/` |
 
 ## End-to-end run (local, offline)
 
@@ -129,6 +130,52 @@ Publish uploads to a staging revision, re-verifies the remote tree/hashes, and
 only then writes `PUBLISHED_VERIFIED.json`. Prior history is never deleted.
 Statuses: `DRY_RUN`, `BLOCKED`, `UPLOAD_IN_PROGRESS`, `REMOTE_VERIFY_FAILED`,
 `PUBLISHED_VERIFIED`.
+
+## Unified canonical dataset (metadata, filenames, speakers)
+
+`canonical/` turns verified ACCEPT records from **many** datasets into one
+publishable Ornix Dataset with a single namespace:
+
+- every output file is `ornix_<32 lowercase hex>.wav`, sharded as
+  `audio/<first-2-hex>/…` — source filenames/dataset names never appear;
+- training metadata has **exactly six fields** (`audio`, `text`, `file_name`,
+  `speaker`, `duration`, `language`);
+- speaker ids are `spk_<opaque>`, mapped per source dataset+revision, so
+  `speaker_01` in two datasets is never merged; unverified speakers are never
+  merged at all;
+- `ornix_id` and speaker mappings are persistent and stable across retry/resume,
+  allocated before publish and stored **outside** the public tree;
+- the public layout is `train|validation|test/metadata.jsonl` +
+  `<split>/audio/<shard>/…`; empty splits are not created;
+- existing `StagedPublisher`, approval receipt and exact-set remote verification
+  are reused unchanged (the checksum manifest + READY marker make the tree
+  approval-ready).
+
+```bash
+# normalize all accepted rows of a local run into a shared dataset tree
+ornix-dataset canonical export --run-id run1 --workdir work \
+    --dataset work/Ornix-Datasets --state work/ornix-state --allow-train-only
+
+# offline integrity: 6 fields, audio==file_name, no orphan/dangling/dup,
+# duration == real WAV, 24k/mono/PCM16, leakage-safe splits
+ornix-dataset canonical verify --dataset work/Ornix-Datasets
+
+# read the exact six-field contract (raw metadata.jsonl, not HF AudioFolder)
+ornix-dataset canonical load --dataset work/Ornix-Datasets
+
+# publish through the gated publisher (dry-run default; --execute to upload)
+ornix-dataset canonical publish --dataset work/Ornix-Datasets \
+    --repo-id Teedyyy-rm/Ornix-Datasets --approval approval.yaml --execute
+```
+
+Campaign batches export with `canonical export-batch --root … --job … --batch …`
+(plus optional `--metadata` sidecar for transcript/speaker/language).
+
+> Note: reading the tree through `datasets`' `AudioFolder` casts the audio column
+> to the `Audio` feature (`array`/`path`/`sampling_rate`) and does **not** keep
+> `audio: str`; use `canonical.loader.load_ornix_dataset` (raw `metadata.jsonl`)
+> when the strict six-field contract is required. See
+> [`docs/CANONICAL-NORMALIZATION.md`](docs/CANONICAL-NORMALIZATION.md).
 
 ## Policies
 

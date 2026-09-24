@@ -327,6 +327,11 @@ class OrnixPipeline:
             redistribution_permitted=bool(src.redistribution_permitted),
             quality_evidence_id=seg_id, quality_policy_version=self.policy.policy_version,
             quality_gate="ACCEPT", split="train", release_id="pending",
+            source_uri=src.source_uri, source_revision=src.source_revision,
+            original_file_id=src.original_file_id,
+            source_speaker_ref=src.source_speaker_ref,
+            language_verified=bool(src.source_language),
+            transcript_verified=bool(transcript_valid and src.source_transcript),
         )
 
     def ingest_and_stage(self, adapter, paths: RunPaths, audit: AuditLog) -> List[SourceRecord]:
