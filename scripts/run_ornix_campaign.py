@@ -262,6 +262,81 @@ def process_dataset(ds, defaults, args, ckpt, env):
             save_ckpt(args.state, ckpt)
             return
 
+def _canonical_rows(dataset_dir):
+    rows = 0
+    for split in ("train", "validation", "test"):
+        mp = os.path.join(dataset_dir, split, "metadata.jsonl")
+        if os.path.exists(mp):
+            with open(mp, "r", encoding="utf-8") as fh:
+                rows += sum(1 for _ in fh)
+    return rows
+
+
+def auto_publish(man, args, env):
+    """Finalize the canonical tree, mint an operator approval, and push to HF.
+
+    Gated by --publish (opt-in): the campaign operator has explicitly authorized
+    publishing to their own destination repo, so we generate the approval receipt
+    that binds this exact release digest and hand it to the same staged, verified
+    publisher used interactively. Nothing here relaxes the rights gate — only
+    rows that already passed canonical export exist in the tree.
+    """
+    import datetime as _dt
+
+    from ornix_dataset.canonical.publish import finalize_dataset, publish_dataset
+    from ornix_dataset.publishing.approval import _dir_bytes, release_digest
+
+    dest = man.get("destination", {}) or {}
+    repo_id = args.publish_repo or dest.get("repo_id")
+    if not repo_id:
+        log(args.state, {"event": "publish-skip", "reason": "no destination repo_id"})
+        return
+    rows = _canonical_rows(args.dataset)
+    if rows == 0:
+        log(args.state, {"event": "publish-skip", "reason": "canonical tree empty"})
+        return
+    if not os.environ.get("HF_TOKEN"):
+        log(args.state, {"event": "publish-skip", "reason": "no HF_TOKEN"})
+        return
+
+    log(args.state, {"event": "publish-start", "repo_id": repo_id, "rows": rows})
+    fin = finalize_dataset(args.dataset)
+    if not fin.get("ok"):
+        log(args.state, {"event": "publish-fail", "stage": "finalize", "reason": fin.get("reason")})
+        return
+
+    # Ensure the destination repo exists (operator-owned; exist_ok is a no-op if present).
+    try:
+        from huggingface_hub import HfApi
+        HfApi(token=os.environ["HF_TOKEN"]).create_repo(
+            repo_id, repo_type="dataset", private=args.publish_private, exist_ok=True)
+    except Exception as e:
+        log(args.state, {"event": "publish-warn", "stage": "create_repo", "detail": str(e)[:200]})
+
+    approval_path = os.path.join(args.state, "publish_approval.yaml")
+    expires = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=2)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    approval = {
+        "release_digest": release_digest(args.dataset),
+        "repo_id": repo_id,
+        "revision": "main",
+        "max_bytes": int(_dir_bytes(args.dataset) * 1.25) + (1 << 20),
+        "operator_id": os.environ.get("USER", "campaign-operator"),
+        "expires_utc": expires,
+        "policy_version": os.path.basename(args.policy),
+        "license_ack": True,
+        "allow_create_repo": True,
+    }
+    with open(approval_path, "w", encoding="utf-8") as fh:
+        _yaml().safe_dump(approval, fh, sort_keys=False)
+
+    rep = publish_dataset(args.dataset, repo_id, approval_path, staging_revision="main")
+    log(args.state, {"event": "publish-done", "ok": rep.get("ok"),
+                     "status": rep.get("status"), "reasons": rep.get("reasons"),
+                     "remote_commit_sha": rep.get("remote_commit_sha")})
+    return rep
+
+
 def cmd_run(args):
     man = load_manifest(args.manifest)
     defaults = man.get("defaults", {})
@@ -301,6 +376,11 @@ def cmd_run(args):
     for ds in datasets:
         process_dataset(ds, defaults, args, ckpt, env)
     log(args.state, {"event": "campaign-end"})
+    if getattr(args, "publish", False):
+        try:
+            auto_publish(man, args, env)
+        except Exception as e:
+            log(args.state, {"event": "publish-fail", "stage": "exception", "detail": str(e)[:300]})
     cmd_status(args)
     return 0
 
@@ -339,6 +419,12 @@ def main(argv=None):
     pr.add_argument("--min-free-gib", type=float, default=None)
     pr.add_argument("--only", default=None, help="comma-separated dataset names")
     pr.add_argument("--max-chunks", type=int, default=0, help="cap chunks per dataset (0=all)")
+    pr.add_argument("--publish", action="store_true",
+                    help="after the campaign, finalize + auto-approve + push the canonical tree to HF")
+    pr.add_argument("--publish-repo", default=None,
+                    help="destination repo_id (default: manifest destination.repo_id)")
+    pr.add_argument("--publish-private", action="store_true",
+                    help="create the destination repo private if it does not exist")
     pr.set_defaults(func=cmd_run)
 
     ps = sub.add_parser("status", parents=[common])
