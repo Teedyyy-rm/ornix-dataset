@@ -7,6 +7,15 @@ mutates a pinned revision.
 """
 
 from .models import Batch, BatchStatus, Campaign, DatasetJob, JobStatus, batch_id_for
+from .downloading import (
+    MANIFEST_NAME,
+    batch_staging_dir,
+    downloaded_files,
+    fetch_job_inventory,
+    manifest_path,
+    read_manifest,
+    run_batch,
+)
 from .planning import plan_batches
 from .refs import (
     canonical_repo_id,
@@ -37,16 +46,23 @@ __all__ = [
     "CampaignStore",
     "DatasetJob",
     "JobStatus",
+    "MANIFEST_NAME",
     "ReservationLedger",
     "StageProfile",
     "WatermarkGate",
     "batch_id_for",
+    "batch_staging_dir",
     "canonical_repo_id",
     "default_resolver",
+    "downloaded_files",
+    "fetch_job_inventory",
     "is_full_sha",
+    "manifest_path",
     "normalize_repo_ref",
     "pin_revision",
     "plan_batches",
     "plan_with_budget",
+    "read_manifest",
+    "run_batch",
     "try_admit",
 ]

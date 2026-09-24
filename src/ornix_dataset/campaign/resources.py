@@ -197,6 +197,8 @@ def plan_with_budget(repo_id: str, pinned_sha: str, job_id: Optional[str],
                                  f"verified streaming path or bigger budget"}
         batches.append(Batch(
             batch_id=bid, job_id=jid, index=idx, files=paths,
+            file_sizes={p: (s if isinstance(s, int) and s >= 0 else None)
+                        for p, s in g},
             total_bytes=known_sum, n_unknown_bytes=unknown_n,
             reservation=reservation,
             checkpoint_rel=f"{checkpoint_prefix}/{jid}/{bid}.jsonl",

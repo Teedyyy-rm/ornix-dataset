@@ -304,6 +304,66 @@ def cmd_campaign_plan(args) -> int:
     return 0
 
 
+def cmd_campaign_inventory(args) -> int:
+    import json
+
+    from .campaign import CampaignStore, fetch_job_inventory
+    from .util.io import atomic_write_text
+
+    store = CampaignStore(args.root)
+    try:
+        job = store.load_job(args.job)
+    except FileNotFoundError:
+        _print({"error": f"unknown job {args.job}"})
+        return 2
+    try:
+        from huggingface_hub import HfApi
+
+        api = HfApi(token=os.environ.get("HF_TOKEN"))
+        entries = fetch_job_inventory(api, job, allow=args.allow,
+                                      ignore=args.ignore)
+    except ValueError as e:
+        _print({"error": str(e)})
+        return 2
+    except Exception as e:
+        _print({"error": f"inventory fetch failed: {e}"})
+        return 3
+    out = args.out or store.inventory_file(job.job_id)
+    atomic_write_text(out, "".join(
+        json.dumps({"path": p, "size": s, "sha": h},
+                   ensure_ascii=False, sort_keys=True) + "\n"
+        for p, s, h in entries))
+    _print({"job": job.job_id, "repo_id": job.repo_id,
+            "pinned_sha": job.pinned_sha, "n_files": len(entries),
+            "inventory": out})
+    return 0
+
+
+def cmd_campaign_download(args) -> int:
+    from .campaign import Budget, CampaignStore, run_batch
+    from .ingestion.hf_downloader import DownloadConfig
+
+    store = CampaignStore(args.root)
+    try:
+        campaign = store.load_campaign()
+        store.load_job(args.job)
+        store.load_batch(args.batch)
+    except FileNotFoundError as e:
+        _print({"error": f"unknown campaign/job/batch: {e}"})
+        return 2
+    try:
+        budget = Budget.from_workspace(campaign.workspace, store.root,
+                                       min_free_bytes=args.min_free)
+    except ValueError as e:
+        _print({"error": str(e)})
+        return 2
+    cfg = DownloadConfig(file_workers=args.workers)
+    rep = run_batch(store, args.job, args.batch, caps=budget.stage_caps,
+                    min_free_bytes=budget.min_free_bytes, cfg=cfg)
+    _print(rep)
+    return 0 if rep.get("ok") else 3
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ornix-dataset",
                                 description="Ornix dataset quality & curation (fail-closed)")
@@ -417,6 +477,20 @@ def build_parser() -> argparse.ArgumentParser:
                      default=512 * 1024**2)
     cp_.add_argument("--max-unknown", type=int, default=50)
     cp_.set_defaults(func=cmd_campaign_plan)
+    ci = cpsub.add_parser("inventory", help="list job files at the pinned commit")
+    ci.add_argument("--root", required=True)
+    ci.add_argument("--job", required=True)
+    ci.add_argument("--allow", nargs="*", default=None)
+    ci.add_argument("--ignore", nargs="*", default=None)
+    ci.add_argument("--out", default=None)
+    ci.set_defaults(func=cmd_campaign_inventory)
+    cd = cpsub.add_parser("download", help="download one batch into verified staging")
+    cd.add_argument("--root", required=True)
+    cd.add_argument("--job", required=True)
+    cd.add_argument("--batch", required=True)
+    cd.add_argument("--workers", type=int, default=4)
+    cd.add_argument("--min-free", type=int, default=None)
+    cd.set_defaults(func=cmd_campaign_download)
     return p
 
 

@@ -54,6 +54,8 @@ def plan_batches(repo_id: str, pinned_sha: str, job_id: Optional[str],
         oversize = len(g) == 1 and (g[0][1] or 0) > max_bytes
         out.append(Batch(
             batch_id=bid, job_id=jid, index=idx, files=paths,
+            file_sizes={p: (s if isinstance(s, int) and s >= 0 else None)
+                        for p, s in g},
             total_bytes=total, n_unknown_bytes=unknown,
             checkpoint_rel=f"{checkpoint_prefix}/{jid}/{bid}.jsonl",
             result={"oversize": bool(oversize)} if oversize else {}))

@@ -54,6 +54,7 @@ class Batch:
     job_id: str
     index: int
     files: List[str] = field(default_factory=list)
+    file_sizes: Dict[str, Optional[int]] = field(default_factory=dict)
     total_bytes: int = 0       # known bytes only; unknown sizes excluded
     n_unknown_bytes: int = 0   # files whose size is not known yet
     reservation: Dict[str, Any] = field(default_factory=dict)  # MD-002 fills in

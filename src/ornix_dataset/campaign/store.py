@@ -49,7 +49,9 @@ class CampaignStore:
         self.jobs_dir = os.path.join(self.root, "jobs")
         self.batches_dir = os.path.join(self.root, "batches")
         self.checkpoints_dir = os.path.join(self.root, "checkpoints")
-        for d in (self.jobs_dir, self.batches_dir, self.checkpoints_dir):
+        self.inventory_dir = os.path.join(self.root, "inventory")
+        for d in (self.jobs_dir, self.batches_dir, self.checkpoints_dir,
+                  self.inventory_dir):
             os.makedirs(d, exist_ok=True)
 
     # -- paths -----------------------------------------------------------
@@ -72,6 +74,12 @@ class CampaignStore:
         if "/" in job_id or "/" in batch_id:
             raise ValueError("unsafe checkpoint components")
         return os.path.join(self.checkpoints_dir, job_id, f"{batch_id}.jsonl")
+
+    def inventory_file(self, job_id: str) -> str:
+        """Default home of `campaign inventory` output for a job."""
+        if "/" in job_id or job_id.startswith("."):
+            raise ValueError(f"unsafe job_id: {job_id!r}")
+        return os.path.join(self.inventory_dir, f"{job_id}.jsonl")
 
     def batch_checkpoint(self, batch: Batch) -> Checkpoint:
         """A ready-to-use Checkpoint bound to this batch's log path."""
