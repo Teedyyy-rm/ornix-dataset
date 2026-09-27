@@ -167,6 +167,23 @@ def cleanup_batch(store: Any, job_id: str, batch_id: str,
             "manifest_archive": manifest_archive_path(store, job_id, batch_id)}
 
 
+def _siblings_processed(store: Any, job: Any, exclude: str = "") -> bool:
+    """True when every batch of the job reached at least BATCH_PROCESSED.
+
+    The release gate is job-global, so it can only succeed once no batch is
+    still PLANNED / IN_PROGRESS. Used to defer gate attempts instead of
+    retrying a premature, guaranteed-failing gate.
+    """
+    ok_states = (BatchStatus.BATCH_PROCESSED.value,
+                 BatchStatus.RELEASE_READY.value, BatchStatus.DONE.value)
+    for bid in job.batch_ids:
+        if bid == exclude:
+            continue
+        if store.load_batch(bid).status not in ok_states:
+            return False
+    return True
+
+
 def pump_campaign(store: Any, ledger: Any, gate: Any,
                   download_one: Callable[..., Dict[str, Any]],
                   qc_one: Callable[[str, str], Dict[str, Any]],
@@ -252,6 +269,12 @@ def pump_campaign(store: Any, ledger: Any, gate: Any,
                                  job_id, bid, {"ok": rep.get("ok")}):
                         return _report(campaign, log, steps)
                 elif st == BatchStatus.BATCH_PROCESSED.value:
+                    # The gate is job-global: it refuses until EVERY sibling
+                    # batch is processed. Attempting it early would burn the
+                    # step budget on a guaranteed failure and starve the QC
+                    # of later batches (they never get their turn), so defer.
+                    if not _siblings_processed(store, job, bid):
+                        continue
                     rep = gate_one(job_id, bid)
                     progressed = True
                     if not _step("gate", job_id, bid, {"ok": rep.get("ok")}):

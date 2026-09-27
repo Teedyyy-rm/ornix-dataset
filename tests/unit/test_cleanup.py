@@ -286,6 +286,72 @@ def test_pump_drives_two_datasets_to_done(tmp_path, monkeypatch):
             assert not os.path.exists(batch_staging_dir(store.root, jid, bid))
 
 
+def test_pump_does_not_starve_qc_behind_premature_gate(tmp_path):
+    """A job-global gate must not block the QC of not-yet-processed batches.
+
+    Regression: the pump tried the gate as soon as batch 1 was processed, the
+    gate refused (batch 2 not processed), and the loop re-picked batch 1 every
+    pass — burning the whole step budget while batch 2 was never QC'd.
+    """
+    store = CampaignStore(str(tmp_path / "c"))
+    _, out = store.create_campaign("starve", [{"repo": f"org/A@{SHA}"}],
+                                   workspace={"min_free_bytes": 1024},
+                                   resolver=lambda r, v: SHA)
+    jid = out[0]["job_id"]
+    budget = Budget(workspace_max_bytes=100 * GB, min_free_bytes=1024,
+                    max_files_per_batch=1, max_batch_bytes=10 * GB)
+    batches = store.plan_job_batches(jid, [("a.wav", 10), ("b.wav", 10)],
+                                     budget=budget)
+    assert len(batches) == 2
+    ledger = ReservationLedger(budget.stage_caps)
+    wm = WatermarkGate(1024, 2048)
+    qc_seen = []
+
+    def _download(j, b):
+        bb = store.load_batch(b)
+        bb.status = "IN_PROGRESS"
+        bb.result = {**(bb.result or {}),
+                     "download": {"complete": True, "n_files": 1}}
+        store.save_batch(bb)
+        return {"ok": True, "complete": True}
+
+    def _qc(j, b):
+        qc_seen.append(b)
+        bb = store.load_batch(b)
+        bb.status = "BATCH_PROCESSED"
+        store.save_batch(bb)
+        return {"ok": True}
+
+    gate_calls = []
+
+    def _gate(j, b):
+        # Mirrors the real job-global gate: refuses until EVERY batch is
+        # processed. Returning ok=True unconditionally would hide the bug.
+        gate_calls.append(b)
+        ready = all(store.load_batch(x).status in
+                    ("BATCH_PROCESSED", "RELEASE_READY", "DONE")
+                    for x in store.load_job(j).batch_ids)
+        if not ready:
+            return {"ok": False, "reason": "global-evidence-incomplete"}
+        bb = store.load_batch(b)
+        bb.status = "RELEASE_READY"
+        store.save_batch(bb)
+        return {"ok": True}
+
+    rep = pump_campaign(store, ledger, wm, _download, _qc, _gate,
+                        max_steps=20, overlap=True)
+    actions = [(e["action"], e.get("batch")) for e in rep["log"]]
+    # both batches must be QC'd, and the gate only after the second one
+    assert sorted(qc_seen) == sorted(b.batch_id for b in batches), actions
+    assert len(gate_calls) >= 1, actions
+    first_qc = min(i for i, a in enumerate(actions) if a[0] == "qc")
+    first_gate = min(i for i, a in enumerate(actions) if a[0] == "gate")
+    qc_batches = {a[1] for a in actions if a[0] == "qc"}
+    # no gate attempt before every batch was QC'd
+    assert first_gate > first_qc
+    assert len(qc_batches) == 2, actions
+
+
 def test_cli_cleanup_pump_fail_closed(tmp_path, capsys):
     from ornix_dataset.cli import main
 
