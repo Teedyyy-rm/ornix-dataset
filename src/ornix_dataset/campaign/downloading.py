@@ -50,16 +50,45 @@ MANIFEST_NAME = "BATCH_MANIFEST.jsonl"
 
 
 def _lfs_sha(entry: Any) -> Optional[str]:
+    """LFS/Xet content hash, across huggingface_hub layouts.
+
+    hub 1.x exposes ``lfs.oid``; hub 2.x exposes ``lfs.sha256`` (and leaves
+    ``oid`` unset). Missing this means downloads are only size-checked, so
+    both spellings are accepted and anything else degrades to None.
+    """
     lfs = getattr(entry, "lfs", None) or {}
-    oid = (lfs.get("oid") if isinstance(lfs, dict)
-           else getattr(lfs, "oid", None))
-    if isinstance(oid, str) and len(oid) == 64:
-        try:
-            int(oid, 16)
-            return oid.lower()
-        except ValueError:
-            return None
+    candidates = []
+    if isinstance(lfs, dict):
+        candidates += [lfs.get("oid"), lfs.get("sha256")]
+    else:
+        candidates += [getattr(lfs, "oid", None),
+                       getattr(lfs, "sha256", None)]
+    for oid in candidates:
+        if isinstance(oid, str) and len(oid) == 64:
+            try:
+                int(oid, 16)
+                return oid.lower()
+            except ValueError:
+                continue
     return None
+
+
+def _is_repo_folder(entry: Any) -> bool:
+    """True for directory entries across hub versions.
+
+    hub 1.x set ``entry.type``; hub 2.x dropped it and returns ``RepoFolder``
+    (no ``size``/``lfs``). Defaulting a missing ``type`` to "file" let folder
+    rows into the inventory and broke the downloader on a non-file path.
+    """
+    kind = getattr(entry, "type", None)
+    if kind in ("directory", "folder"):
+        return True
+    if kind == "file":
+        return False
+    if type(entry).__name__.endswith("Folder"):
+        return True
+    # No type info at all: a real listing always gives files a size.
+    return getattr(entry, "size", None) is None and not getattr(entry, "lfs", None)
 
 
 def fetch_job_inventory(api: Any, job: DatasetJob,
@@ -75,7 +104,7 @@ def fetch_job_inventory(api: Any, job: DatasetJob,
     out: List[Tuple[str, Optional[int], Optional[str]]] = []
     for entry in api.list_repo_tree(job.repo_id, revision=job.pinned_sha,
                                     repo_type="dataset", recursive=True):
-        if getattr(entry, "type", "file") != "file":
+        if _is_repo_folder(entry):
             continue
         path = getattr(entry, "path", "")
         if not path or not matches_patterns(path, allow, ignore):
