@@ -24,6 +24,7 @@ import os
 from typing import Any, Callable, Dict, List, Optional
 
 from ..audit.events import AuditLog
+from ..contracts.enums import RightsStatus
 from ..contracts.source import SourceRecord
 from ..curation.dedup import exact_duplicates
 from ..curation.split import assign_splits, split_leakage
@@ -50,6 +51,42 @@ def qc_paths(store: Any, job_id: str, batch_id: str,
     return RunPaths.create(base, qc_run_id(job_id, batch_id))
 
 
+def _job_rights_fields(job: Any) -> Dict[str, Any]:
+    """Map a job's operator-declared rights onto SourceRecord fields.
+
+    The campaign manifest declares rights ONCE per dataset (configs/*campaign*
+    .yaml), so QC must apply them to every row — otherwise SourceRecord keeps
+    its fail-closed defaults (UNKNOWN / redistribute=False) and the required
+    ``rights_ok`` check rejects 100% of a legitimately-licensed corpus.
+
+    Fail-closed: a missing, empty or unparsable declaration yields UNKNOWN
+    rights (=> LICENSE_REVIEW downstream), never an inferred approval.
+    """
+    rights = dict(getattr(job, "rights", None) or {})
+    if not rights:
+        return {}
+    raw_status = str(rights.get("status") or "").strip().upper()
+    try:
+        status = RightsStatus(raw_status) if raw_status else RightsStatus.UNKNOWN
+    except ValueError:
+        status = RightsStatus.UNKNOWN
+    # An APPROVED status without the explicit flag is not approval.
+    redistribute = bool(rights.get("redistribute", False))
+    if status != RightsStatus.REDISTRIBUTION_APPROVED:
+        redistribute = False
+    if status == RightsStatus.FORBIDDEN:
+        redistribute = False
+    return {"rights_status": status,
+            "redistribution_permitted": redistribute,
+            "commercial_training_permitted":
+                str(rights.get("commercial", "UNKNOWN")),
+            "source_license": str(rights.get("license") or "UNKNOWN"),
+            "attribution_required": bool(rights.get("attribution_required", True)),
+            "rights_owner": rights.get("owner"),
+            "consent_reference": rights.get("consent_reference"),
+            "license_evidence_uri": rights.get("evidence_uri")}
+
+
 def manifest_to_source_record(row: Dict[str, Any], job: Any,
                               staging_dir: str) -> SourceRecord:
     """Deterministic SourceRecord from a verified manifest row.
@@ -59,6 +96,7 @@ def manifest_to_source_record(row: Dict[str, Any], job: Any,
     remote blob sha exists, but stable even when the Hub gives none.
     Transcript/language ride along when the row carries them (parquet
     expansion); otherwise they stay None (UNKNOWN downstream, fail-closed).
+    Rights come from the job's operator declaration, never inferred.
     """
     sha = row["sha256"]
     uri = row["source_uri"]
@@ -71,7 +109,8 @@ def manifest_to_source_record(row: Dict[str, Any], job: Any,
         source_transcript=row.get("source_transcript"),
         source_language=row.get("source_language") or "vi",
         source_speaker_ref=row.get("source_speaker_ref"),
-        ingestion_timestamp_utc=utc_now_iso())
+        ingestion_timestamp_utc=utc_now_iso(),
+        **_job_rights_fields(job))
 
 
 def qc_workers() -> int:
