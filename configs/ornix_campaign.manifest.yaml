@@ -1,7 +1,8 @@
 # Ornix multi-dataset campaign manifest (driver: scripts/run_ornix_campaign.py).
 #
-# Full-scale curation of 10 Vietnamese speech datasets into ONE unified
+# Full-scale curation of 9 Vietnamese speech datasets into ONE unified
 # canonical tree, then a gated publish to the destination repo.
+# (FPT FOSD excluded: its parquet embeds MP3, skipped by wav-only mode.)
 # Layout/columns/licenses below were PROBED from the Hub (2026-09-27), not guessed.
 #
 # Rights are OPERATOR-DECLARED here, never inferred by the tool:
@@ -60,14 +61,6 @@ datasets:
     text_col: text
     speaker: {mode: fixed, ref: thanh_nam}
     rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "true", license: CC-BY-SA-4.0, note: "VietBibleVox-aligned CC-BY-SA-4.0; share-alike"}
-
-  - name: fpt_fosd
-    repo: doof-ferb/fpt_fosd
-    format: parquet
-    parquet_prefix: data
-    text_col: transcription
-    speaker: {mode: none}
-    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "true", license: CC-BY-4.0, note: "FPT FOSD CC-BY-4.0"}
 
   - name: hatrang_voice
     repo: quocs/hatrang-voice-4h
