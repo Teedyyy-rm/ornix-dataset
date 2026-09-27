@@ -283,7 +283,7 @@ def extract_loose(args, api, fs):
     _write_meta(args.out, meta)
     return {"written": len(meta), "exhausted": True, "sha": info.sha[:12]}
 
-def main(argv=None) -> int:
+def _build_parser():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repo", required=True)
     ap.add_argument("--out", required=True)
@@ -300,7 +300,16 @@ def main(argv=None) -> int:
     ap.add_argument("--loose-meta", default=None)
     ap.add_argument("--loose-meta-kind", choices=["csv", "jsonl"], default="csv")
     ap.add_argument("--file-col", default="file_name")
-    args = ap.parse_args(argv)
+    return ap
+
+
+def run_extraction(argv=None):
+    """Run extraction and return the result dict (no stdout).
+
+    Thread-safe entry point for the in-process campaign driver: raises
+    SystemExit on fatal failure, never prints (the CLI wrapper prints).
+    """
+    args = _build_parser().parse_args(argv)
 
     from huggingface_hub import HfApi, HfFileSystem
     token = os.environ.get("HF_TOKEN")
@@ -308,12 +317,18 @@ def main(argv=None) -> int:
     fs = HfFileSystem(token=token)
 
     if args.format == "parquet":
-        res = extract_parquet(args, api, fs)
+        return extract_parquet(args, api, fs)
     elif args.format == "arrow":
-        res = extract_arrow(args, api, fs)
-    else:
-        res = extract_loose(args, api, fs)
+        return extract_arrow(args, api, fs)
+    return extract_loose(args, api, fs)
 
+
+def main(argv=None) -> int:
+    args = _build_parser().parse_args(argv)
+    try:
+        res = run_extraction(argv)
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else 1
     print(f"[ok] repo={args.repo}@{res['sha']} format={args.format} "
           f"wrote {res['written']} clips -> {args.out} (exhausted={res['exhausted']})")
     print("     NOTE: rights are declared by the operator downstream; not inferred here.")

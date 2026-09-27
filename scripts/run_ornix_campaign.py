@@ -208,15 +208,6 @@ def _inprocess_enabled():
     return v not in ("0", "false", "no", "off", "")
 
 
-def _capture_stdout(fn, *a, **k):
-    import contextlib
-    import io
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        rc = fn(*a, **k)
-    return rc, buf.getvalue()
-
-
 def run_dataset_local(ds, defaults, args, push=None):
     """In-process full dataset: extract ALL + ingest + qc + canonical-export.
 
@@ -224,7 +215,9 @@ def run_dataset_local(ds, defaults, args, push=None):
     stage runs in this worker process, so the cached pipeline keeps model
     sessions warm across datasets.
     """
-    import argparse as _ap
+    # NOTE: every stage below is a direct object call — never stdout capture.
+    # redirect_stdout is process-global and corrupts results when dataset
+    # workers run on threads.
     name = ds["name"]
     extract_dir = os.path.join(args.workdir, "campaign_extract", name)
     shutil.rmtree(extract_dir, ignore_errors=True)
@@ -235,40 +228,45 @@ def run_dataset_local(ds, defaults, args, push=None):
     try:
         import extract_hf_audio
         from ornix_dataset import cli as cli_mod
+        from ornix_dataset.audit.events import AuditLog
+        from ornix_dataset.canonical.bridge import sample_from_accepted_row
+        from ornix_dataset.canonical.normalize import normalize_samples
+        from ornix_dataset.config import build_gate_and_adapters
+        from ornix_dataset.contracts.source import SourceRecord
+        from ornix_dataset.curation.policy import PolicyConfig
+        from ornix_dataset.pipeline import AnalyzeResult, OrnixPipeline, RunPaths
+        from ornix_dataset.util.jsonl import read_jsonl
         ecmd = extractor_cmd(ds, defaults, extract_dir, args.loose_workers)
         try:
-            rc, out = _capture_stdout(extract_hf_audio.main, ecmd[2:])
+            res = extract_hf_audio.run_extraction(ecmd[2:])
         except SystemExit as e:
             return None, {"error": f"extract exit={e.code}"}
-        res = parse_result_line(out)
-        if rc != 0 or res is None:
-            return None, {"error": f"extract rc={rc}: {out[-400:]}"}
+        except Exception as e:
+            return None, {"error": f"extract failed: {e}"}
         stats["written"] = res["written"]
         if res["written"] == 0:
             return res, stats
         write_sources_yaml(ds, extract_dir, res["sha"], src_yaml)
-        ns = _ap.Namespace(config=src_yaml, run_id=run_id, workdir=args.workdir)
-        rc, out = _capture_stdout(cli_mod.cmd_ingest, ns)
-        if rc != 0:
-            return res, {**stats, "error": f"ingest rc={rc}: {out[-400:]}"}
-        j = parse_last_json(out) or {}
-        stats["ingested"] = j.get("ingested", 0)
+        paths = RunPaths.create(args.workdir, run_id)
+        audit = AuditLog(paths.audit, run_id=run_id)
+        gate, adapters, _specs = build_gate_and_adapters(src_yaml)
+        stub = PolicyConfig(policy_version="ingest-only",
+                            required_checks=["rights_ok"])
+        ing_pipe = OrnixPipeline(args.workdir, stub)
+        total = 0
+        for adapter in adapters:
+            total += len(ing_pipe.ingest_and_stage(adapter, paths, audit))
+        stats["ingested"] = total
         # Warm the model server before QC so the first dataset pays load
         # once, not per file.
         pipe = get_campaign_pipeline(args.workdir, args.policy, args.models_lock,
                                      args.audio_profile)
-        from ornix_dataset.audit.events import AuditLog
-        from ornix_dataset.canonical.bridge import sample_from_accepted_row
-        from ornix_dataset.canonical.normalize import normalize_samples
-        from ornix_dataset.contracts.source import SourceRecord
-        from ornix_dataset.pipeline import AnalyzeResult, RunPaths
-        from ornix_dataset.util.jsonl import read_jsonl
-        paths = RunPaths.create(args.workdir, run_id)
         # Reset evidence/accepted for an idempotent re-run (same as cmd_qc).
+        # paths/audit already exist from ingest above; keep the same AuditLog
+        # so event seq numbers stay monotonic.
         for p in (paths.evidence, paths.accepted):
             if os.path.exists(p):
                 os.remove(p)
-        audit = AuditLog(paths.audit, run_id=run_id)
         records = [SourceRecord.from_dict(r) for r in read_jsonl(paths.source_manifest)]
         every = push["every"] if push else 0
         step = every if every > 0 else len(records)
@@ -536,6 +534,13 @@ def auto_publish(man, args, env):
 
 
 def cmd_run(args):
+    # Load .env once (existing env vars win) so HF_TOKEN and tuning knobs are
+    # available to in-process stages — same contract as `ornix-dataset` CLI.
+    try:
+        from ornix_dataset.ops.env import load_dotenv
+        load_dotenv()
+    except Exception:
+        pass
     man = load_manifest(args.manifest)
     defaults = man.get("defaults", {})
     if args.min_free_gib is None:
