@@ -166,7 +166,9 @@ def expand_batch_parquet(store: Any, job: Any, batch: Any,
     changed = False
     for row in list(rows):
         fid = row.get("original_file_id", "")
-        if not is_parquet_path(fid.split("#")[0]):
+        if "#row-" in fid:
+            continue  # already a clip row, never a container to expand
+        if not is_parquet_path(fid):
             continue
         # Already expanded? clip rows exist with this prefix.
         prefix = fid + "#row-"
@@ -192,6 +194,9 @@ def expand_batch_parquet(store: Any, job: Any, batch: Any,
         merged = {r.get("original_file_id"): r for r in rows}
         _write_manifest(staging, [merged[k] for k in sorted(merged)])
         rows = read_manifest(staging)
-    return {"n_parquet": sum(1 for r in rows if is_parquet_path(
-        r.get("original_file_id", "").split("#")[0])),
+    return {"n_parquet": sum(1 for r in rows
+                             if is_parquet_path(r.get("original_file_id", ""))
+                             and "#row-" not in r.get("original_file_id", "")),
+            "n_clips": sum(1 for r in rows
+                           if "#row-" in r.get("original_file_id", "")),
             "n_clips_added": added, "reports": reports}

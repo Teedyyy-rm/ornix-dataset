@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..ingestion.hf_downloader import (
@@ -36,11 +37,14 @@ from ..ingestion.hf_downloader import (
 from ..util.io import atomic_write_text
 from ..util.jsonl import append_jsonl, load_jsonl
 from .models import BatchStatus, DatasetJob
+from .parquet import expand_parquet_row, is_parquet_path
 from .resources import ReservationLedger, try_admit
 
 # Checkpoint states that count a batch file as downloaded (kept local: the
 # shared Checkpoint.done set has pipeline-level meanings we must not widen).
-DOWNLOADED_STATES = ("DOWNLOADED", "DONE")
+# EXTRACTED is the terminal state of a downloaded parquet shard whose clips
+# were expanded and whose parent bytes were dropped.
+DOWNLOADED_STATES = ("DOWNLOADED", "EXTRACTED", "DONE")
 
 MANIFEST_NAME = "BATCH_MANIFEST.jsonl"
 
@@ -127,6 +131,95 @@ def _manifest_row(job: DatasetJob, res: Any, staging: str) -> Dict[str, Any]:
         "reused_staged": bool(res.reused_staged)}
 
 
+def _append_rows(path: str, rows: List[Dict[str, Any]],
+                 seen: set) -> int:
+    """Append manifest rows that are not present yet; fsync once at the end."""
+    added = 0
+    if not rows:
+        return 0
+    with open(path, "a", encoding="utf-8") as fh:
+        for r in rows:
+            fid = r.get("original_file_id")
+            if fid in seen:
+                continue
+            fh.write(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n")
+            seen.add(fid)
+            added += 1
+        fh.flush()
+        os.fsync(fh.fileno())
+    return added
+
+
+def expand_and_drop_parquet(job: DatasetJob, staging: str, res: Any,
+                            ckpt: Any) -> Optional[Dict[str, Any]]:
+    """Expand a verified parquet shard into clips, then drop the parent bytes.
+
+    Bounded disk (anti-slow-download): the container is removed as soon as its
+    clips exist and are hashed, so staging never holds a downloaded shard
+    longer than the moment it takes to unpack it. Provenance (repo, pinned
+    revision, verified sha256, size) survives in the manifest parent row.
+
+    Returns None for non-parquet files, else a report dict. Fail-closed: a
+    shard that cannot be unpacked is marked EXTRACT_BLOCKED and its bytes are
+    KEPT (never dropped without a verified clip set).
+    """
+    if not is_parquet_path(res.path_in_repo):
+        return None
+    row = _manifest_row(job, res, staging)
+    new_rows, rep = expand_parquet_row(staging, row)
+    if not rep.get("ok"):
+        ckpt.mark(res.path_in_repo, "EXTRACT_BLOCKED",
+                  reason=rep.get("reason", "unknown"))
+        return rep
+    seen = {r.get("original_file_id") for r in read_manifest(staging)}
+    added = _append_rows(manifest_path(staging), new_rows, seen)
+    dropped, drop_error = False, ""
+    try:
+        if os.path.exists(res.staged_path):
+            os.remove(res.staged_path)
+            dropped = True
+    except OSError as e:  # parent stays on disk; QC never needs it
+        drop_error = str(e)
+    ckpt.mark(res.path_in_repo, "EXTRACTED", n_clips=len(new_rows),
+              clips_added=added, parent_dropped=dropped,
+              drop_error=drop_error or None)
+    return {"ok": True, "original_file_id": res.path_in_repo,
+            "n_clips": len(new_rows), "clips_added": added,
+            "parent_dropped": dropped}
+
+
+def reap_expired_parents(job: DatasetJob, staging: str,
+                         ckpt: Any) -> List[str]:
+    """Drop parquet parents whose clips are already in the manifest.
+
+    Crash-recovery twin of ``expand_and_drop_parquet``: if a run died between
+    appending clips and unlinking the parent, the next run finishes the job.
+    Returns the repo paths whose parent bytes were removed.
+    """
+    rows = read_manifest(staging)
+    parents = [r for r in rows
+               if is_parquet_path(r.get("original_file_id", ""))]
+    if not parents:
+        return []
+    all_ids = {r.get("original_file_id") for r in rows}
+    reaped: List[str] = []
+    for parent in parents:
+        fid = parent["original_file_id"]
+        prefix = fid + "#row-"
+        if not any(i.startswith(prefix) for i in all_ids):
+            continue  # clips absent: never drop unproven bytes
+        path = os.path.join(staging, parent.get("staged_path", ""))
+        if not os.path.exists(path):
+            continue
+        try:
+            os.remove(path)
+        except OSError:
+            continue
+        reaped.append(fid)
+        ckpt.mark(fid, "EXTRACTED", parent_dropped=True, reaped=True)
+    return reaped
+
+
 def run_batch(store: Any, job_id: str, batch_id: str,
               caps: Dict[str, int], min_free_bytes: int,
               ledger: Optional[ReservationLedger] = None,
@@ -164,9 +257,12 @@ def run_batch(store: Any, job_id: str, batch_id: str,
     # (reads only; safe before admission since it moves zero bytes)
     have = {r.get("original_file_id") for r in read_manifest(staging)}
     if have.issuperset(batch.files):
+        # Finish any interrupted "expand then drop" before reporting done.
+        reaped = reap_expired_parents(job, staging,
+                                      store.batch_checkpoint(batch))
         return {"ok": True, "admitted": False, "reason": "already-complete",
                 "n_files": len(batch.files), "downloaded": 0,
-                "reused": len(batch.files)}
+                "reused": len(batch.files), "parents_reaped": reaped}
     if batch.status == "IN_PROGRESS":
         # _execute promotes to IN_PROGRESS only on full completion, so this
         # means external interference (e.g. manifest deleted): fail closed
@@ -223,24 +319,33 @@ def _execute(store: Any, job: DatasetJob, batch: Any, staging: str,
                            download_fn=download_fn,
                            cache_check_fn=cache_check_fn)
 
-    def _on_ready(res: DownloadResult) -> None:
-        # Per-file handoff (G2): checkpoint mark + manifest row land the moment
-        # the file is verified-staged — a crash or a concurrent QC tail never
-        # waits for the whole batch. on_ready runs on the drain (calling)
-        # thread, in completion order.
-        ckpt.mark(res.path_in_repo, "DOWNLOADED", sha256=res.sha256,
-                  staged_path=res.staged_path, size=res.size)
-        append_jsonl(manifest_path(staging), _manifest_row(job, res, staging))
+    extracted: List[Dict[str, Any]] = []
+    write_lock = threading.Lock()
+
+    def _on_staged(res: DownloadResult) -> None:
+        # Earliest handoff (in the io/staging thread, see HfBatchDownloader).
+        # Doing it here — not on the drain — is what bounds disk: a parquet
+        # shard is unpacked and unlinked in the same window in which it is
+        # the only file being staged, instead of queueing up as resident bytes.
+        with write_lock:
+            ckpt.mark(res.path_in_repo, "DOWNLOADED", sha256=res.sha256,
+                      staged_path=res.staged_path, size=res.size)
+            append_jsonl(manifest_path(staging),
+                         _manifest_row(job, res, staging))
+            rep = expand_and_drop_parquet(job, staging, res, ckpt)
+            if rep is not None:
+                extracted.append(rep)
 
     try:
         results = dl.run(items, staged_name=_flat_staged_name,
-                         skip_staged=skip_staged, on_ready=_on_ready)
+                         skip_staged=skip_staged, on_staged=_on_staged)
     except Exception as e:
         batch.result = {**(batch.result or {}),
-                        "download": {"complete": False, "error": str(e)}}
+                        "download": {"complete": False, "error": str(e),
+                                     "n_extracted": len(extracted)}}
         store.save_batch(batch)
         return {"ok": False, "admitted": True, "reason": "download-error",
-                "error": str(e)}
+                "error": str(e), "n_extracted": len(extracted)}
 
     # Reconcile: streamed rows + any pre-existing rows, deduped and ordered.
     # The atomic rewrite is what guarantees no duplicate rows across retries.
@@ -253,14 +358,32 @@ def _execute(store: Any, job: DatasetJob, batch: Any, staging: str,
     rows = [merged[k] for k in sorted(merged)]
     _write_manifest(staging, rows)
     for res in results:
+        if is_parquet_path(res.path_in_repo):
+            # Do not resurrect a DOWNLOADED state over an EXTRACTED one: the
+            # Checkpoint replays the LAST mark, and that must stay EXTRACTED.
+            if not any(e.get("original_file_id") == res.path_in_repo
+                       for e in extracted):
+                ckpt.mark(res.path_in_repo, "DOWNLOADED", sha256=res.sha256,
+                          staged_path=res.staged_path, size=res.size)
+            continue
         ckpt.mark(res.path_in_repo, "DOWNLOADED", sha256=res.sha256,
                   staged_path=res.staged_path, size=res.size)
     known = set(merged)
 
     complete = known.issuperset(batch.files)
+    n_parents = sum(1 for k in known
+                    if is_parquet_path(k) and "#row-" not in k)
+    n_clips = sum(1 for k in known if "#row-" in k)
     summary = {"complete": complete,
                "n_files": len(batch.files),
                "n_staged": len(known),
+               "n_parents": n_parents,
+               "n_clips": n_clips,
+               "n_extracted": sum(1 for e in extracted if e.get("ok")),
+               "n_extract_blocked": sum(1 for e in extracted
+                                        if not e.get("ok")),
+               "parents_dropped": sum(1 for e in extracted
+                                      if e.get("parent_dropped")),
                "pending": sorted(set(batch.files) - known),
                "network_bytes": dl.metrics.network_bytes,
                "n_reused_staged": dl.metrics.n_reused_staged,

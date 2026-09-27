@@ -674,7 +674,8 @@ class HfBatchDownloader:
     def run(self, items: List[InventoryItem],
             staged_name: Optional[Callable[[InventoryItem], str]] = None,
             skip_staged: Optional[Dict[str, str]] = None,
-            on_ready: Optional[Callable[[DownloadResult], None]] = None
+            on_ready: Optional[Callable[[DownloadResult], None]] = None,
+            on_staged: Optional[Callable[[DownloadResult], None]] = None
             ) -> List[DownloadResult]:
         """Download+verify+stage a batch; returns results in INVENTORY ORDER.
 
@@ -685,6 +686,13 @@ class HfBatchDownloader:
         Out-of-order completion never changes manifest order (single ordered
         writer in the drainer). Fatal errors stop the producer, running tasks
         finish cleanly, then the first error is raised.
+
+        ``on_staged`` runs earlier — in the io/staging thread, immediately
+        after a file is verified-staged and BEFORE it enters the ready queue.
+        Use it for work that must bound resident bytes (e.g. unpack a parquet
+        shard and unlink it), so a file is never merely "staged and waiting".
+        It runs concurrently across ``verify_workers`` threads and must be
+        thread-safe; its peak concurrency is exactly that setting.
         """
         self._check_ram_guard()
         self._check_disk(sum(i.size for i in items))
@@ -742,6 +750,11 @@ class HfBatchDownloader:
                                              staged_name)
                 with self._metrics_lock:
                     self.metrics.t_verify_stage_s += res.t_verify_stage_s
+                if on_staged is not None:
+                    # Earliest safe point: bytes are staged and verified, but
+                    # not yet queued. Bounding work belongs HERE so a staged
+                    # file never sits idle occupying disk.
+                    on_staged(res)
                 self._ready.put(res)  # blocks when full: backpressure (T4)
             except BaseException as exc:  # noqa: BLE001
                 self._set_abort(exc)
