@@ -102,10 +102,12 @@ def build_release(release_id: str, rows: List[Dict[str, Any]],
 
     ready_payload_extra = {"release_target": release_target}
 
-    # 5. checksums over every emitted file
-    _write_manifest_sha(out_dir, audio_out)
-    files.append(os.path.join(out_dir, "MANIFEST.sha256"))
-
+    # 5. readiness marker FIRST, checksums LAST.
+    # Order matters on a REBUILD: a stale RELEASE_READY.json from a previous
+    # run must not be hashed and then overwritten (that leaves MANIFEST.sha256
+    # describing bytes that no longer exist, and the rebuilt release fails its
+    # own verification). So: drop stale markers -> write the marker -> hash
+    # everything, marker included.
     ready = not blockers
     ready_payload = {
         "release_id": release_id, "ready": ready, "blockers": blockers,
@@ -114,11 +116,18 @@ def build_release(release_id: str, rows: List[Dict[str, Any]],
         "export_format": export_format,
         **ready_payload_extra,
     }
-    if ready:
-        write_json(os.path.join(out_dir, "RELEASE_READY.json"), ready_payload)
-        files.append(os.path.join(out_dir, "RELEASE_READY.json"))
-    else:
-        write_json(os.path.join(out_dir, "RELEASE_BLOCKED.json"), ready_payload)
+    marker = "RELEASE_READY.json" if ready else "RELEASE_BLOCKED.json"
+    stale = "RELEASE_BLOCKED.json" if ready else "RELEASE_READY.json"
+    for name in (marker, stale):
+        p = os.path.join(out_dir, name)
+        if os.path.exists(p):
+            os.remove(p)
+    write_json(os.path.join(out_dir, marker), ready_payload)
+    files.append(os.path.join(out_dir, marker))
+
+    # checksums over every emitted file (MANIFEST.sha256 excludes only itself)
+    _write_manifest_sha(out_dir, audio_out)
+    files.append(os.path.join(out_dir, "MANIFEST.sha256"))
     return ReleaseArtifacts(out_dir, ready, blockers, files, len(validated))
 
 
