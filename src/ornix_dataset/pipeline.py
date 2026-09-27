@@ -68,6 +68,17 @@ class AnalyzeResult:
     accepted: List[ReleaseRow] = field(default_factory=list)
 
 
+def no_split_enabled() -> bool:
+    """True when ORNIX_NO_SPLIT=1: discard splittable sources whole.
+
+    Long files (>max) are already dropped by the technical gate; this covers
+    the remainder — files the segment planner would cut or trim. No salvaged
+    parts, no transcript-stripped rows in the release.
+    """
+    v = os.environ.get("ORNIX_NO_SPLIT", "0").strip().lower()
+    return v not in ("0", "false", "no", "off", "")
+
+
 def slice_noise_events(events: List[NoiseEvent], s: float,
                        e: float) -> List[NoiseEvent]:
     """Restrict full-clip noise events to segment [s, e) in segment coords.
@@ -337,6 +348,47 @@ class OrnixPipeline:
         audit.emit("decision", seg_id, decision=decision.decision.value,
                    reasons=decision.reason_codes)
 
+    def _reject_split_source(self, src, buf: AudioBuffer, paths, audit, result,
+                               admission: Optional[AdmissionReport] = None,
+                               n_intervals: int = 0) -> None:
+        """Discard a source that would need segmentation (ORNIX_NO_SPLIT=1).
+
+        Long/noisy files are dropped whole instead of salvaged in parts, so
+        no sub-segment with a stripped transcript ever enters the release.
+        The evidence still goes through the real PolicyEngine for check
+        bookkeeping, but the decision is forced to REJECT — no required
+        check covers splitting, so the engine alone could still ACCEPT.
+        """
+        sr = buf.sample_rate
+        seg_id = "SEG_" + short_id(src.source_sha256, "nosplit")
+        ev = QualityEvidence(
+            segment_id=seg_id, source_sha256=src.source_sha256,
+            interval_start_sample=0, interval_end_sample=buf.n_samples,
+            analysis_sample_rate=sr,
+            transcript_match_status=transcript_match_status(
+                src.source_transcript,
+                verified=bool(getattr(src, "_transcript_verified", False))),
+            source_container=getattr(admission, "source_container", None),
+            source_lossy=getattr(admission, "source_lossy", None),
+            source_rate_class=getattr(admission, "source_rate_class", None),
+            canonicalization_action=getattr(admission, "canonicalization_action", None),
+            effective_bandwidth_hz=getattr(admission, "effective_bandwidth_hz", None),
+            low_bandwidth_suspected=bool(getattr(admission, "low_bandwidth_suspected", False)),
+            policy_version=self.policy.policy_version, timestamp_utc=utc_now_iso(),
+        )
+        decision = self.engine.decide(ev, src, self.availability)
+        reasons = list(decision.reason_codes)
+        if "REQUIRES_SEGMENTATION" not in reasons:
+            reasons.append("REQUIRES_SEGMENTATION")
+        ev.decision = DecisionState.REJECT
+        ev.reason_codes = reasons
+        ev.observed_checks = decision.observed_checks
+        ev.required_checks = decision.required_checks
+        append_jsonl(paths.evidence, ev.to_dict())
+        result.evidences.append(ev)
+        audit.emit("decision", seg_id, decision="REJECT",
+                    reasons=reasons, n_intervals=n_intervals)
+
     def _analyze_segments(self, src, buf: AudioBuffer, paths, audit, result,
                            admission: Optional[AdmissionReport] = None) -> None:
         sr = buf.sample_rate
@@ -355,9 +407,13 @@ class OrnixPipeline:
                              silence_points=silence_points)
         if not plan.intervals_s:
             plan.intervals_s = [[0.0, min(buf.duration_s, self.tech.max_duration_s)]]
-        quality_batch = self._batch_quality(buf, plan.intervals_s)
         segmented = len(plan.intervals_s) > 1 or (
             plan.intervals_s and total_duration(plan.intervals_s) < buf.duration_s - 0.2)
+        if no_split_enabled() and segmented:
+            self._reject_split_source(src, buf, paths, audit, result, admission,
+                                      n_intervals=len(plan.intervals_s))
+            return
+        quality_batch = self._batch_quality(buf, plan.intervals_s)
         for idx, (s, e) in enumerate(plan.intervals_s):
             uncertain = idx in getattr(plan, "uncertain_indices", set())
             self._process_segment(src, buf, s, e, idx, speech, paths, audit, result,
