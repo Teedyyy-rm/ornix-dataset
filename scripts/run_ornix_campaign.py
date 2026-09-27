@@ -257,6 +257,14 @@ def run_dataset_local(ds, defaults, args, push=None):
         for adapter in adapters:
             total += len(ing_pipe.ingest_and_stage(adapter, paths, audit))
         stats["ingested"] = total
+        if total == 0 and res["written"] > 0:
+            # Loud, not silent: extracted files exist but none entered QC
+            # (e.g. mp3 content skipped by wav-only mode). The dataset would
+            # otherwise finish "done" with zero rows and no explanation.
+            log(args.state, {"dataset": name, "event": "ingest-empty",
+                             "written": res["written"],
+                             "note": "0 ingested; non-wav sources are skipped "
+                             "when ORNIX_WAV_ONLY=1 (set 0 to transcode)"})
         # Warm the model server before QC so the first dataset pays load
         # once, not per file.
         pipe = get_campaign_pipeline(args.workdir, args.policy, args.models_lock,

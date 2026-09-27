@@ -8,11 +8,25 @@ from typing import Any, Dict
 
 TASK_CATEGORIES = ("text-to-speech", "automatic-speech-recognition")
 
+# Hub-valid dataset license ids (lowercase). Anything else (operator-declared
+# terms, free text) maps to "other" — an unknown id makes the Hub reject the
+# whole commit ("Invalid metadata in README.md").
+_HF_LICENSES = frozenset({
+    "mit", "apache-2.0", "cc0-1.0", "cc-by-4.0", "cc-by-sa-4.0",
+    "cc-by-nc-4.0", "cc-by-nc-sa-4.0", "cc-by-nd-4.0", "cc-by-nc-nd-4.0",
+    "odc-by", "gpl-3.0", "lgpl-3.0", "artistic-2.0", "other",
+})
+
+
+def hub_license(raw: str) -> str:
+    lid = (raw or "").strip().lower()
+    return lid if lid in _HF_LICENSES else "other"
+
 
 def render_card(stats: Dict[str, Any], rights: Dict[str, Any],
                 changelog: str = "") -> str:
     langs = sorted(stats.get("languages", {})) or ["und"]
-    licenses = sorted(rights.get("licenses", [])) or ["see-source-terms"]
+    licenses = sorted({hub_license(l) for l in rights.get("licenses", [])}) or ["other"]
     splits = [s for s in ("train", "validation", "test")
               if stats.get("by_split", {}).get(s, 0) > 0]
     fm = ["---", "pretty_name: Ornix Datasets", "language:",
