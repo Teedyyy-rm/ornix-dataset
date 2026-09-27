@@ -83,19 +83,83 @@ def cmd_ingest(args) -> int:
     return 0
 
 
+def qc_workers() -> int:
+    """QC thread count: ORNIX_QC_WORKERS or 6 on an 8-core box.
+
+    DSP analysis is CPU-bound and near-linear; leave 2 cores for I/O and
+    the OS. Capped at 16, floored at 1. Set to 1 for exact legacy
+    sequential behavior.
+    """
+    try:
+        explicit = int(os.environ.get("ORNIX_QC_WORKERS", "0") or 0)
+    except ValueError:
+        explicit = 0
+    if explicit > 0:
+        return max(1, min(explicit, 16))
+    cores = os.cpu_count() or 8
+    return max(2, min(6, max(1, cores - 2)))
+
+
 def qc_records(pipe, records, paths, audit):
     """QC a list of SourceRecords into paths (evidence/accepted files + result).
 
     Split-agnostic core shared by cmd_qc and the campaign's per-N slicer; the
     caller owns manifest reset, split finalization and funnel reporting.
-    """
-    from .pipeline import AnalyzeResult
 
+    Multi-threaded (ORNIX_QC_WORKERS, default 6): each worker analyzes with
+    private temp evidence/audit files sharing only the canonical dir (unique
+    segment ids — no collisions); the main thread merges results in input
+    order, so output order is identical to the sequential path. Analyzer
+    exceptions propagate fail-fast, exactly like the sequential loop.
+    """
+    import tempfile
+
+    from .pipeline import AnalyzeResult
+    from .util.jsonl import append_jsonl as _append
+
+    records = list(records)
+    workers = qc_workers()
+    if workers <= 1 or len(records) <= 1:
+        combined = AnalyzeResult()
+        for rec in records:
+            res = pipe.analyze_source(rec, paths, audit)
+            combined.evidences.extend(res.evidences)
+            combined.accepted.extend(res.accepted)
+        return combined
+
+    def _one(rec):
+        tmpdir = tempfile.mkdtemp(prefix="qc-one-")
+        shim = RunPaths(root=tmpdir, source_manifest="",
+                        evidence=os.path.join(tmpdir, "evidence.jsonl"),
+                        accepted=os.path.join(tmpdir, "accepted.jsonl"),
+                        review="", audit=os.path.join(tmpdir, "audit.jsonl"),
+                        canonical_dir=paths.canonical_dir)
+        tmp_audit = AuditLog(shim.audit, run_id=audit.run_id)
+        res = pipe.analyze_source(rec, shim, tmp_audit)
+        au_events = list(read_jsonl(shim.audit))
+        try:
+            import shutil as _sh
+            _sh.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+        return (res, au_events)
+
+    from concurrent.futures import ThreadPoolExecutor
     combined = AnalyzeResult()
-    for rec in records:
-        res = pipe.analyze_source(rec, paths, audit)
-        combined.evidences.extend(res.evidences)
-        combined.accepted.extend(res.accepted)
+    with ThreadPoolExecutor(max_workers=min(workers, len(records))) as ex:
+        for res, au_events in ex.map(_one, records):
+            combined.evidences.extend(res.evidences)
+            combined.accepted.extend(res.accepted)
+            for ev in res.evidences:
+                _append(paths.evidence, ev.to_dict())
+            for ac in res.accepted:
+                _append(paths.accepted, ac.to_dict())
+            for evt in au_events:
+                audit.emit(str(evt.get("event", "qc_event")),
+                           str(evt.get("subject", "")),
+                           **{k: v for k, v in evt.items()
+                              if k not in ("seq", "ts_utc", "run_id",
+                                           "event", "subject")})
     return combined
 
 
