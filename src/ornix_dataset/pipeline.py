@@ -26,10 +26,11 @@ from .detectors import DetectorKind, registry
 from .detectors.windowing import intersect_intervals, total_duration
 from .dsp.audio import AudioBuffer
 from .dsp.admission import AdmissionConfig, AdmissionReport, assess_source
-from .dsp.decode import decode_to_float
+from .dsp.decode import DecodeError, decode_to_float, wav_only_enabled
 from .dsp.features import signal_stats
 from .dsp.render import RenderVerificationError, render_canonical_wav
-from .dsp.technical import TechnicalThresholds, run_technical_validation
+from .dsp.technical import (TechnicalReport, TechnicalThresholds, probe_info_for,
+                            run_technical_validation_on_buffer)
 from .util.hashing import sha256_json, short_id
 from .util.io import write_json
 from .util.jsonl import append_jsonl, write_jsonl
@@ -67,6 +68,34 @@ class AnalyzeResult:
     accepted: List[ReleaseRow] = field(default_factory=list)
 
 
+def slice_noise_events(events: List[NoiseEvent], s: float,
+                       e: float) -> List[NoiseEvent]:
+    """Restrict full-clip noise events to segment [s, e) in segment coords.
+
+    Fail-closed bias: any event merely overlapping the segment is kept (clipped
+    to bounds), never dropped on boundary ambiguity — policy gates over these
+    events can only stay as strict or get stricter, never looser. This lets the
+    pipeline run the DSP/music detectors once per source clip instead of once
+    per segment.
+    """
+    out: List[NoiseEvent] = []
+    for ev in events:
+        if ev.end_s <= s or ev.start_s >= e:
+            continue
+        out.append(NoiseEvent(
+            label=ev.label,
+            start_s=round(max(ev.start_s, s) - s, 4),
+            end_s=round(min(ev.end_s, e) - s, 4),
+            overlaps_speech=ev.overlaps_speech,
+            severity=ev.severity,
+            confidence=ev.confidence,
+            score=ev.score,
+            detector=ev.detector,
+            model_revision=ev.model_revision,
+        ))
+    return out
+
+
 class OrnixPipeline:
     def __init__(self, workdir: str, policy: PolicyConfig,
                  vad_name: str = "energy", noise_name: str = "dsp",
@@ -97,6 +126,28 @@ class OrnixPipeline:
                 "speaker": bool(self.speaker.available),
             }
 
+    @staticmethod
+    def _ingest_probe_info(src: SourceRecord) -> Optional[Dict[str, Any]]:
+        """Rebuild an ffprobe-shaped dict from ingest-time provenance.
+
+        Ingest already probed every staged file (ffprobe subprocess). Reusing it
+        saves ~0.5s/clip here; run_technical_validation still guards with an
+        on-disk size check and falls back to a fresh ffprobe on any mismatch.
+        Returns None when ingest recorded no usable probe (same as before).
+        """
+        if src.source_codec is None or not src.source_bytes:
+            return None
+        return {
+            "codec_name": src.source_codec,
+            "sample_rate": src.source_sample_rate,
+            "channels": src.source_channels,
+            "bits_per_raw_sample": None,
+            "sample_fmt": None,
+            "duration_s": src.source_duration_s,
+            "format_name": src.source_container,
+            "size_bytes": src.source_bytes,
+        }
+
     def analyze_source(self, src: SourceRecord, paths: RunPaths,
                        audit: AuditLog) -> AnalyzeResult:
         result = AnalyzeResult()
@@ -112,8 +163,46 @@ class OrnixPipeline:
             audit.emit("analyze_error", src.source_id, reason="STAGED_PATH_MISSING",
                        staged_path=src.staged_path or "")
             return result
-        report = run_technical_validation(src.staged_path, self.tech,
-                                          declared_duration_s=src.source_duration_s)
+        # wav-only fast path: skip non-WAV before any ffprobe/decode/convert.
+        if wav_only_enabled() and os.path.splitext(src.staged_path)[1].lower() != ".wav":
+            report = TechnicalReport(False, "REJECT_TECH", ["NON_WAV_SKIPPED"])
+            audit.emit("technical", src.source_id, decision=report.decision,
+                       reasons=report.reason_codes)
+            ev = self._reject_tech_evidence(src, report)
+            append_jsonl(paths.evidence, ev.to_dict())
+            result.evidences.append(ev)
+            return result
+        # Decode ONCE (mono=False) and reuse the buffer for both the technical
+        # gate and the downstream mono analysis — previously this decoded the
+        # file twice (once stereo in the gate, once mono here).
+        try:
+            info = probe_info_for(src.staged_path,
+                                  self._ingest_probe_info(src))
+        except DecodeError as e:
+            report = TechnicalReport(False, "ERROR", [f"PROBE_FAILED:{e}"])
+            audit.emit("technical", src.source_id, decision=report.decision,
+                       reasons=report.reason_codes)
+            ev = self._reject_tech_evidence(src, report)
+            append_jsonl(paths.evidence, ev.to_dict())
+            result.evidences.append(ev)
+            return result
+        try:
+            buf_stereo, _decoder = decode_to_float(src.staged_path, mono=False)
+        except DecodeError as e:
+            report = TechnicalReport(
+                False, "REJECT_TECH", [f"DECODE_FAILED:{e}"],
+                measured_sample_rate=info.get("sample_rate"),
+                codec_name=info.get("codec_name"),
+                format_name=info.get("format_name"))
+            audit.emit("technical", src.source_id, decision=report.decision,
+                       reasons=report.reason_codes)
+            ev = self._reject_tech_evidence(src, report)
+            append_jsonl(paths.evidence, ev.to_dict())
+            result.evidences.append(ev)
+            return result
+        report = run_technical_validation_on_buffer(
+            buf_stereo, info, self.tech,
+            declared_duration_s=src.source_duration_s)
         audit.emit("technical", src.source_id, decision=report.decision,
                    reasons=report.reason_codes)
         if not report.valid:
@@ -134,7 +223,9 @@ class OrnixPipeline:
             append_jsonl(paths.evidence, ev.to_dict())
             result.evidences.append(ev)
             return result
-        buf, _ = decode_to_float(src.staged_path, mono=True)
+        # Reuse the single decode above: to_mono() is a no-op (no copy) when
+        # the source is already mono, and a cheap mean-downmix otherwise.
+        buf = buf_stereo.to_mono()
         self._analyze_segments(src, buf, paths, audit, result, admission)
         return result
 
@@ -179,9 +270,79 @@ class OrnixPipeline:
             events.extend(self.music.infer(samples, sr, speech_intervals))
         return events
 
-    def _analyze_segments(self, src, buf: AudioBuffer, paths, audit, result,
-                          admission: Optional[AdmissionReport] = None) -> None:
+    def _batch_quality(self, buf: AudioBuffer,
+                       intervals: List[List[float]]) -> Optional[Dict[int, Dict[str, Any]]]:
+        """Score all segment DNSMOS inputs in one session.run.
+
+        Returns idx -> infer()-shaped dict. None when the adapter is missing /
+        unavailable or batching fails — _build_evidence then falls back to the
+        original per-segment infer(), so failure semantics never change.
+        """
+        if self.quality is None or not self.quality.available:
+            return None
+        batch_fn = getattr(self.quality, "infer_batch", None)
+        if batch_fn is None:
+            return None
         sr = buf.sample_rate
+        idxs: List[int] = []
+        items: List[Any] = []
+        for idx, (s, e) in enumerate(intervals):
+            seg = buf.samples[int(s * sr):int(e * sr)]
+            if seg.size == 0:
+                continue
+            idxs.append(idx)
+            items.append((seg, sr))
+        if not items:
+            return None
+        try:
+            res = batch_fn(items)
+        except Exception:
+            return None
+        return dict(zip(idxs, res))
+
+    def _reject_short_source(self, src, buf: AudioBuffer, paths, audit, result,
+                              admission: Optional[AdmissionReport] = None) -> None:
+        """Fast REJECT for sources shorter than the policy minimum.
+
+        Duration is already measured (technical gate + decode); a source below
+        policy.min_duration_s can never ACCEPT (duration_ok is a required
+        check), so running VAD/noise/DNSMOS/render on it only burns seconds
+        for an identical REJECT. The evidence still goes through the real
+        PolicyEngine, so decision + reason codes match the full path exactly.
+        """
+        sr = buf.sample_rate
+        seg_id = "SEG_" + short_id(src.source_sha256, "short")
+        ev = QualityEvidence(
+            segment_id=seg_id, source_sha256=src.source_sha256,
+            interval_start_sample=0, interval_end_sample=buf.n_samples,
+            analysis_sample_rate=sr,
+            transcript_match_status=transcript_match_status(
+                src.source_transcript,
+                verified=bool(getattr(src, "_transcript_verified", False))),
+            source_container=getattr(admission, "source_container", None),
+            source_lossy=getattr(admission, "source_lossy", None),
+            source_rate_class=getattr(admission, "source_rate_class", None),
+            canonicalization_action=getattr(admission, "canonicalization_action", None),
+            effective_bandwidth_hz=getattr(admission, "effective_bandwidth_hz", None),
+            low_bandwidth_suspected=bool(getattr(admission, "low_bandwidth_suspected", False)),
+            policy_version=self.policy.policy_version, timestamp_utc=utc_now_iso(),
+        )
+        decision = self.engine.decide(ev, src, self.availability)
+        ev.decision = decision.decision
+        ev.reason_codes = decision.reason_codes
+        ev.observed_checks = decision.observed_checks
+        ev.required_checks = decision.required_checks
+        append_jsonl(paths.evidence, ev.to_dict())
+        result.evidences.append(ev)
+        audit.emit("decision", seg_id, decision=decision.decision.value,
+                   reasons=decision.reason_codes)
+
+    def _analyze_segments(self, src, buf: AudioBuffer, paths, audit, result,
+                           admission: Optional[AdmissionReport] = None) -> None:
+        sr = buf.sample_rate
+        if buf.duration_s < self.policy.min_duration_s:
+            self._reject_short_source(src, buf, paths, audit, result, admission)
+            return
         speech = self.vad.infer(buf.samples, sr)
         events = self._detect_noise(buf.samples, sr, speech)
         exclude = [[e.start_s, e.end_s] for e in events
@@ -194,17 +355,21 @@ class OrnixPipeline:
                              silence_points=silence_points)
         if not plan.intervals_s:
             plan.intervals_s = [[0.0, min(buf.duration_s, self.tech.max_duration_s)]]
+        quality_batch = self._batch_quality(buf, plan.intervals_s)
         segmented = len(plan.intervals_s) > 1 or (
             plan.intervals_s and total_duration(plan.intervals_s) < buf.duration_s - 0.2)
         for idx, (s, e) in enumerate(plan.intervals_s):
             uncertain = idx in getattr(plan, "uncertain_indices", set())
             self._process_segment(src, buf, s, e, idx, speech, paths, audit, result,
                                    segmented=segmented, boundary_uncertain=uncertain,
-                                   admission=admission)
+                                   admission=admission, full_events=events,
+                                   quality_batch=quality_batch)
 
     def _process_segment(self, src, buf, s, e, idx, speech, paths, audit, result,
-                         segmented: bool = False, boundary_uncertain: bool = False,
-                         admission: Optional[AdmissionReport] = None) -> None:
+                          segmented: bool = False, boundary_uncertain: bool = False,
+                          admission: Optional[AdmissionReport] = None,
+                          full_events: Optional[List[NoiseEvent]] = None,
+                          quality_batch: Optional[Dict[int, Dict[str, Any]]] = None) -> None:
         sr = buf.sample_rate
         a, b = int(s * sr), int(e * sr)
         seg = buf.samples[a:b]
@@ -227,8 +392,10 @@ class OrnixPipeline:
         # a sub-segment cannot inherit the whole-source transcript verbatim
         transcript_valid = not (segmented or boundary_uncertain)
         ev = self._build_evidence(src, seg_buf, seg_id, a, b, s, e, speech, recipe,
-                                  transcript_valid=transcript_valid,
-                                  admission=admission, canonical_sha256=audio_sha)
+                                   transcript_valid=transcript_valid,
+                                   admission=admission, canonical_sha256=audio_sha,
+                                   full_events=full_events,
+                                   seg_idx=idx, quality_batch=quality_batch)
         decision = self.engine.decide(ev, src, self.availability)
         ev.decision = decision.decision
         ev.reason_codes = decision.reason_codes
@@ -245,15 +412,21 @@ class OrnixPipeline:
             result.accepted.append(row)
 
     def _build_evidence(self, src, seg_buf, seg_id, a, b, s, e, speech, recipe,
-                        transcript_valid: bool = True,
-                        admission: Optional[AdmissionReport] = None,
-                        canonical_sha256: Optional[str] = None) -> QualityEvidence:
+                         transcript_valid: bool = True,
+                         admission: Optional[AdmissionReport] = None,
+                         canonical_sha256: Optional[str] = None,
+                         full_events: Optional[List[NoiseEvent]] = None,
+                         seg_idx: Optional[int] = None,
+                         quality_batch: Optional[Dict[int, Dict[str, Any]]] = None) -> QualityEvidence:
         sr = seg_buf.sample_rate
         stats = signal_stats(seg_buf.samples)
         seg_speech = intersect_intervals(speech, [[s, e]])
         seg_dur = max(1e-9, e - s)
         speech_ratio = min(1.0, total_duration(seg_speech) / seg_dur)
-        seg_events = self._detect_noise(seg_buf.samples, sr, [[0.0, seg_dur]])
+        if full_events is not None:
+            seg_events = slice_noise_events(full_events, s, e)
+        else:
+            seg_events = self._detect_noise(seg_buf.samples, sr, [[0.0, seg_dur]])
         # transcript: only trust the source transcript for a whole-source clip
         if transcript_valid:
             tstatus = transcript_match_status(
@@ -265,7 +438,11 @@ class OrnixPipeline:
         # real quality (DNSMOS) evidence when the adapter is available
         sig = bak = ovrl = None
         quality_status = MeasurementStatus.UNKNOWN
-        if self.quality is not None and self.quality.available:
+        if quality_batch is not None and seg_idx in quality_batch:
+            q = quality_batch[seg_idx]
+            sig, bak, ovrl = q.get("sig"), q.get("bak"), q.get("ovrl")
+            quality_status = MeasurementStatus(q.get("status", "UNKNOWN"))
+        elif self.quality is not None and self.quality.available:
             q = self.quality.infer(seg_buf.samples, sr)
             sig, bak, ovrl = q.get("sig"), q.get("bak"), q.get("ovrl")
             quality_status = MeasurementStatus(q.get("status", "UNKNOWN"))

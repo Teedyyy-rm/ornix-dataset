@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """run_ornix_campaign.py — drive the full multi-dataset Ornix campaign.
 
-For each dataset in configs/ornix_campaign.manifest.yaml this streams a bounded
-page of clips (extract_hf_audio.py) into a temp corpus, runs the standard
+For each dataset in configs/ornix_campaign.manifest.yaml this downloads the
+WHOLE dataset (extract_hf_audio.py) into a temp corpus, runs the standard
 ingest -> qc -> canonical-export chain (appending into ONE unified canonical
-tree + persistent identity/speaker state), then DELETES the page before fetching
-the next one. Disk-bounded, resumable (a checkpoint records each dataset's cursor),
-and fail-closed (rights are declared per-dataset in the manifest; the tool never
+tree + persistent identity/speaker state), then DELETES the temp corpus.
+Dataset-level resume (a checkpoint records each dataset's status), and
+fail-closed (rights are declared per-dataset in the manifest; the tool never
 infers them, and canonical export drops anything not redistributable).
 
 Subcommands:
-  run     drive the campaign (resumable; --only NAME to limit; --max-chunks N)
+  run     drive the campaign (resumable; --only NAME to limit)
   status  print the checkpoint + unified-tree stats
 
 This orchestrates only regenerable intermediate work; it never deletes the
@@ -31,6 +31,11 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
+SRC_DIR = os.path.join(REPO, "src")
+if os.path.isdir(SRC_DIR) and SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 
 # Guards shared writes (progress log + checkpoint) when datasets run on a worker
 # pool. Canonical export serializes itself via an flock on the identity state, so
@@ -114,6 +119,211 @@ def parse_last_json(stdout):
             continue
     return None
 
+def _has_gpu() -> bool:
+    """True when a CUDA GPU is usable for inference (torch or onnxruntime)."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return True
+    except Exception:
+        pass
+    try:
+        import onnxruntime as ort
+        if "CUDAExecutionProvider" in ort.get_available_providers():
+            return True
+    except Exception:
+        pass
+    if shutil.which("nvidia-smi") is not None:
+        try:
+            out = subprocess.run(["nvidia-smi", "-L"], capture_output=True,
+                                 text=True, timeout=10)
+            if out.returncode == 0 and "GPU" in (out.stdout or ""):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def resolve_parallelism(n_datasets, workers_arg, ort_arg):
+    """Resolve workers/threads to saturate ~100% CPU (GPU-aware).
+
+    0 (the default) means auto. On GPU boxes each ORT session is capped to 1
+    intra-op thread (inference lives on the GPU) and dataset workers scale up
+    to cpu_count; on CPU-only boxes workers = cpu // ort_threads so
+    workers * threads ~= cores.
+    """
+    cpu = os.cpu_count() or 8
+    gpu = _has_gpu()
+    if ort_arg and ort_arg > 0:
+        ort_threads = max(1, ort_arg)
+    else:
+        ort_threads = 1 if gpu else min(2, cpu)
+    if workers_arg and workers_arg > 0:
+        workers = max(1, workers_arg)
+    elif gpu:
+        workers = min(max(2, cpu), max(1, n_datasets or 1))
+    else:
+        workers = min(max(2, cpu // max(1, ort_threads)),
+                      max(1, n_datasets or 1))
+    probe_workers = max(2, (2 * cpu) // max(1, workers))
+    return {"workers": workers, "ort_threads": ort_threads,
+            "probe_workers": probe_workers, "cpu": cpu, "gpu": gpu}
+
+
+_PIPE_CACHE = {}
+_PIPE_LOCK = threading.Lock()
+
+
+def get_campaign_pipeline(workdir, policy_path, models_lock, audio_profile_path):
+    """Process-wide cached OrnixPipeline (model server: warm ONNX sessions).
+
+    Silero/DNSMOS sessions load once per worker process and are reused across
+    all datasets instead of reloading (+ sha re-verify) per dataset.
+    """
+    key = (os.path.abspath(workdir), os.path.abspath(policy_path or ""),
+           os.path.abspath(models_lock) if models_lock else "",
+           os.path.abspath(audio_profile_path) if audio_profile_path else "")
+    with _PIPE_LOCK:
+        hit = _PIPE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    from ornix_dataset.config import (load_policy_config,
+                                      source_admission_config,
+                                      technical_thresholds)
+    from ornix_dataset.detectors.model_server import get_detectors
+    from ornix_dataset.pipeline import OrnixPipeline
+    policy = load_policy_config(policy_path)
+    detectors = get_detectors(models_lock)
+    pipe = OrnixPipeline(workdir, policy,
+                         tech=technical_thresholds(audio_profile_path),
+                         admission=source_admission_config(audio_profile_path),
+                         detectors=detectors)
+    with _PIPE_LOCK:
+        _PIPE_CACHE[key] = pipe
+    return pipe
+
+
+def _inprocess_enabled():
+    v = os.environ.get("ORNIX_CAMPAIGN_INPROCESS", "1").strip().lower()
+    return v not in ("0", "false", "no", "off", "")
+
+
+def _capture_stdout(fn, *a, **k):
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = fn(*a, **k)
+    return rc, buf.getvalue()
+
+
+def run_dataset_local(ds, defaults, args, push=None):
+    """In-process full dataset: extract ALL + ingest + qc + canonical-export.
+
+    Same stage order and stats contract as run_dataset_subprocess, but every
+    stage runs in this worker process, so the cached pipeline keeps model
+    sessions warm across datasets.
+    """
+    import argparse as _ap
+    name = ds["name"]
+    extract_dir = os.path.join(args.workdir, "campaign_extract", name)
+    shutil.rmtree(extract_dir, ignore_errors=True)
+    os.makedirs(extract_dir, exist_ok=True)
+    src_yaml = os.path.join(extract_dir, "_sources.yaml")
+    run_id = name
+    stats = {"written": 0, "ingested": 0, "accepted": 0, "exported": 0, "blocked": 0}
+    try:
+        import extract_hf_audio
+        from ornix_dataset import cli as cli_mod
+        ecmd = extractor_cmd(ds, defaults, extract_dir, args.loose_workers)
+        try:
+            rc, out = _capture_stdout(extract_hf_audio.main, ecmd[2:])
+        except SystemExit as e:
+            return None, {"error": f"extract exit={e.code}"}
+        res = parse_result_line(out)
+        if rc != 0 or res is None:
+            return None, {"error": f"extract rc={rc}: {out[-400:]}"}
+        stats["written"] = res["written"]
+        if res["written"] == 0:
+            return res, stats
+        write_sources_yaml(ds, extract_dir, res["sha"], src_yaml)
+        ns = _ap.Namespace(config=src_yaml, run_id=run_id, workdir=args.workdir)
+        rc, out = _capture_stdout(cli_mod.cmd_ingest, ns)
+        if rc != 0:
+            return res, {**stats, "error": f"ingest rc={rc}: {out[-400:]}"}
+        j = parse_last_json(out) or {}
+        stats["ingested"] = j.get("ingested", 0)
+        # Warm the model server before QC so the first dataset pays load
+        # once, not per file.
+        pipe = get_campaign_pipeline(args.workdir, args.policy, args.models_lock,
+                                     args.audio_profile)
+        from ornix_dataset.audit.events import AuditLog
+        from ornix_dataset.canonical.bridge import sample_from_accepted_row
+        from ornix_dataset.canonical.normalize import normalize_samples
+        from ornix_dataset.contracts.source import SourceRecord
+        from ornix_dataset.pipeline import AnalyzeResult, RunPaths
+        from ornix_dataset.util.jsonl import read_jsonl
+        paths = RunPaths.create(args.workdir, run_id)
+        # Reset evidence/accepted for an idempotent re-run (same as cmd_qc).
+        for p in (paths.evidence, paths.accepted):
+            if os.path.exists(p):
+                os.remove(p)
+        audit = AuditLog(paths.audit, run_id=run_id)
+        records = [SourceRecord.from_dict(r) for r in read_jsonl(paths.source_manifest)]
+        every = push["every"] if push else 0
+        step = every if every > 0 else len(records)
+        combined = AnalyzeResult()
+        n_blocked = 0
+        for i in range(0, len(records), step or 1):
+            sl = records[i:i + (step or len(records))]
+            res_qc = cli_mod.qc_records(pipe, sl, paths, audit)
+            combined.evidences.extend(res_qc.evidences)
+            combined.accepted.extend(res_qc.accepted)
+            if not res_qc.accepted:
+                continue  # nothing new: tree unchanged, push would be NOOP
+            # Deterministic per-group splits: re-finalizing over the growing
+            # set never moves an earlier row, so slice exports converge with
+            # the final export (no stale remote files).
+            pipe._finalize_splits(combined, paths, audit)
+            samples = [sample_from_accepted_row(r.to_dict(), paths.canonical_dir)
+                       for r in res_qc.accepted]
+            rep = normalize_samples(samples, args.dataset, args.state,
+                                    require_redistributable=True)
+            n_blocked += len(rep.get("blocked", []))
+            stats["exported"] = stats.get("exported", 0) + len(samples) - len(
+                rep.get("blocked", []))
+            if push:
+                _push_slice(args, push, len(sl), stats)
+        stats["accepted"] = len(combined.accepted)
+        stats["blocked"] = n_blocked
+        pipe._finalize_splits(combined, paths, audit)
+        funnel = cli_mod.write_qc_funnel(combined, paths)
+        stats["qc_funnel_accept"] = funnel.get("accept_coverage")
+        return res, stats
+    finally:
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        shutil.rmtree(os.path.join(args.workdir, "runs", run_id), ignore_errors=True)
+        if ds["format"] in ("loose", "arrow"):
+            prune_hf_cache(ds["repo"])
+
+
+def _push_slice(args, push, n_processed, stats):
+    """Export-then-push one slice; ledger isolation means no file is re-pushed."""
+    from ornix_dataset.publishing.incremental import push_tree
+
+    rep = push_tree(args.dataset, push["repo_id"], args.state,
+                    revision="main", policy_path=args.policy)
+    stats["pushed"] = stats.get("pushed", 0) + rep.get("pushed", 0)
+    if rep.get("status") == "NO_PUSH_NEEDED":
+        return
+    log(args.state, {"event": "push-slice", "processed": n_processed,
+                     "pushed": rep.get("pushed"), "skipped": rep.get("skipped"),
+                     "status": rep.get("status"), "reasons": rep.get("reasons"),
+                     "commit": rep.get("commit_sha")})
+    if not rep.get("ok"):
+        stats["push_error"] = rep.get("reasons")
+
+
 def write_sources_yaml(ds, extract_dir, sha, path):
     r = ds["rights"]
     spec = {
@@ -138,13 +348,11 @@ def write_sources_yaml(ds, extract_dir, sha, path):
         _yaml().safe_dump(spec, fh, allow_unicode=True, sort_keys=False)
 
 
-def extractor_cmd(ds, defaults, out_dir, cursor, chunk_rows):
+def extractor_cmd(ds, defaults, out_dir, loose_workers):
     py = sys.executable
     cmd = [py, os.path.join(HERE, "extract_hf_audio.py"),
            "--repo", ds["repo"], "--out", out_dir, "--format", ds["format"],
-           "--limit", str(chunk_rows),
-           "--start-shard", str(cursor.get("next_shard", 0)),
-           "--start-rg", str(cursor.get("next_rg", 0)),
+           "--loose-workers", str(loose_workers),
            "--audio-col", ds.get("audio_col", defaults.get("audio_col", "audio")),
            "--text-col", ds.get("text_col", "text"),
            "--language", ds.get("language", defaults.get("language", "vi"))]
@@ -171,17 +379,28 @@ def prune_hf_cache(repo):
     shutil.rmtree(d, ignore_errors=True)
 
 
-def run_chunk(ds, defaults, args, cursor, chunk_idx, env):
-    """Extract + ingest + qc + canonical-export one page. Returns (result, stats)."""
+def run_dataset(ds, defaults, args, env, push=None):
+    """Full-dataset single pass: extract ALL -> ingest -> qc -> canonical-export.
+
+    Dispatches to the in-process runner (warm model server) or legacy
+    subprocess. Returns (result, stats).
+    """
+    if _inprocess_enabled():
+        return run_dataset_local(ds, defaults, args, push)
+    return run_dataset_subprocess(ds, defaults, args, env, push)
+
+
+def run_dataset_subprocess(ds, defaults, args, env, push=None):
+    """Full-dataset single pass via subprocess stages. Returns (result, stats)."""
     name = ds["name"]
-    extract_dir = os.path.join(args.workdir, "campaign_extract", f"{name}_c{chunk_idx:05d}")
+    extract_dir = os.path.join(args.workdir, "campaign_extract", name)
     shutil.rmtree(extract_dir, ignore_errors=True)
     os.makedirs(extract_dir, exist_ok=True)
     src_yaml = os.path.join(extract_dir, "_sources.yaml")
-    run_id = f"{name}_c{chunk_idx:05d}"
+    run_id = name
     stats = {"written": 0, "ingested": 0, "accepted": 0, "exported": 0, "blocked": 0}
     try:
-        rc, out, err = run(extractor_cmd(ds, defaults, extract_dir, cursor, args.chunk_rows), env)
+        rc, out, err = run(extractor_cmd(ds, defaults, extract_dir, args.loose_workers), env)
         res = parse_result_line(out)
         if rc != 0 or res is None:
             return None, {"error": f"extract rc={rc}: {(err or out)[-400:]}"}
@@ -212,7 +431,9 @@ def run_chunk(ds, defaults, args, cursor, chunk_idx, env):
         stats["exported"] = j.get("n_rows", 0)
         stats["blocked"] = j.get("n_blocked", 0)
         if rc not in (0, 3):
-            stats["error"] = f"canonical rc={rc}: {(err or out)[-400:]}"
+            stats["error"] = f"canonical rc={rc}: {out[-400:]}"
+        if push and "error" not in stats:
+            _push_slice(args, push, stats.get("ingested", 0), stats)
         return res, stats
     finally:
         shutil.rmtree(extract_dir, ignore_errors=True)
@@ -220,55 +441,45 @@ def run_chunk(ds, defaults, args, cursor, chunk_idx, env):
         if ds["format"] in ("loose", "arrow"):
             prune_hf_cache(ds["repo"])
 
-def process_dataset(ds, defaults, args, ckpt, env):
+def process_dataset(ds, defaults, args, ckpt, env, push=None):
+    """Run one dataset end-to-end in a single pass (dataset-level resume).
+
+    A re-run skips datasets marked done; a failed dataset restarts from a
+    clean extract dir (ingest dedups by content sha, QC evidence is rebuilt,
+    and the push ledger skips bytes already verified on the Hub).
+    """
     name = ds["name"]
     st = ckpt["datasets"].setdefault(name, {
-        "status": "pending", "next_shard": 0, "next_rg": 0, "chunks": 0,
-        "written": 0, "exported": 0, "blocked": 0})
+        "status": "pending", "written": 0, "exported": 0, "blocked": 0,
+        "pushed": 0})
     if st["status"] == "done":
         log(args.state, {"dataset": name, "event": "skip-done"})
         return
     st["status"] = "running"
     save_ckpt(args.state, ckpt)
-    log(args.state, {"dataset": name, "event": "start", "cursor": [st["next_shard"], st["next_rg"]]})
-    made = 0
-    while True:
-        fg = free_gib(args.state)
-        if fg < args.min_free_gib:
-            st["status"] = "paused-disk"
-            log(args.state, {"dataset": name, "event": "pause-disk", "free_gib": round(fg, 1)})
-            save_ckpt(args.state, ckpt)
-            return
-        res, stats = run_chunk(ds, defaults, args, st, st["chunks"], env)
-        st["chunks"] += 1
-        made += 1
-        if stats.get("error") and res is None:
-            st["status"] = "error"
-            st["error"] = stats["error"]
-            log(args.state, {"dataset": name, "event": "error", "detail": stats["error"]})
-            save_ckpt(args.state, ckpt)
-            return
-        st["written"] += stats.get("written", 0)
-        st["exported"] += stats.get("exported", 0)
-        st["blocked"] += stats.get("blocked", 0)
-        if res is not None:
-            st["next_shard"] = res.get("next_shard", st["next_shard"])
-            st["next_rg"] = res.get("next_rg", st["next_rg"])
-        log(args.state, {"dataset": name, "event": "chunk", "chunk": st["chunks"],
-                         "free_gib": round(free_gib(args.state), 1), **stats,
-                         "cursor": [st["next_shard"], st["next_rg"]]})
+    log(args.state, {"dataset": name, "event": "start"})
+    fg = free_gib(args.state)
+    if fg < args.min_free_gib:
+        st["status"] = "paused-disk"
+        log(args.state, {"dataset": name, "event": "pause-disk", "free_gib": round(fg, 1)})
         save_ckpt(args.state, ckpt)
-        if res is not None and res.get("exhausted"):
-            st["status"] = "done"
-            log(args.state, {"dataset": name, "event": "done", "written": st["written"],
-                             "exported": st["exported"], "blocked": st["blocked"]})
-            save_ckpt(args.state, ckpt)
-            return
-        if args.max_chunks and made >= args.max_chunks:
-            st["status"] = "paused-maxchunks"
-            log(args.state, {"dataset": name, "event": "pause-maxchunks"})
-            save_ckpt(args.state, ckpt)
-            return
+        return
+    res, stats = run_dataset(ds, defaults, args, env, push)
+    if stats.get("error") and res is None:
+        st["status"] = "error"
+        st["error"] = stats["error"]
+        log(args.state, {"dataset": name, "event": "error", "detail": stats["error"]})
+        save_ckpt(args.state, ckpt)
+        return
+    st["written"] = stats.get("written", 0)
+    st["exported"] = stats.get("exported", 0)
+    st["blocked"] = stats.get("blocked", 0)
+    st["pushed"] = stats.get("pushed", 0)
+    st.pop("error", None)
+    st["status"] = "done"
+    log(args.state, {"dataset": name, "event": "done",
+                     "free_gib": round(free_gib(args.state), 1), **stats})
+    save_ckpt(args.state, ckpt)
 
 def _canonical_rows(dataset_dir):
     rows = 0
@@ -289,11 +500,6 @@ def auto_publish(man, args, env):
     publisher used interactively. Nothing here relaxes the rights gate — only
     rows that already passed canonical export exist in the tree.
     """
-    import datetime as _dt
-
-    from ornix_dataset.canonical.publish import finalize_dataset, publish_dataset
-    from ornix_dataset.publishing.approval import _dir_bytes, release_digest
-
     dest = man.get("destination", {}) or {}
     repo_id = args.publish_repo or dest.get("repo_id")
     if not repo_id:
@@ -308,11 +514,6 @@ def auto_publish(man, args, env):
         return
 
     log(args.state, {"event": "publish-start", "repo_id": repo_id, "rows": rows})
-    fin = finalize_dataset(args.dataset)
-    if not fin.get("ok"):
-        log(args.state, {"event": "publish-fail", "stage": "finalize", "reason": fin.get("reason")})
-        return
-
     # Ensure the destination repo exists (operator-owned; exist_ok is a no-op if present).
     try:
         from huggingface_hub import HfApi
@@ -321,43 +522,55 @@ def auto_publish(man, args, env):
     except Exception as e:
         log(args.state, {"event": "publish-warn", "stage": "create_repo", "detail": str(e)[:200]})
 
-    approval_path = os.path.join(args.state, "publish_approval.yaml")
-    expires = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=2)).strftime(
-        "%Y-%m-%dT%H:%M:%SZ")
-    approval = {
-        "release_digest": release_digest(args.dataset),
-        "repo_id": repo_id,
-        "revision": "main",
-        "max_bytes": int(_dir_bytes(args.dataset) * 1.25) + (1 << 20),
-        "operator_id": os.environ.get("USER", "campaign-operator"),
-        "expires_utc": expires,
-        "policy_version": os.path.basename(args.policy),
-        "license_ack": True,
-        "allow_create_repo": True,
-    }
-    with open(approval_path, "w", encoding="utf-8") as fh:
-        _yaml().safe_dump(approval, fh, sort_keys=False)
-
-    rep = publish_dataset(args.dataset, repo_id, approval_path, staging_revision="main")
+    # Final push goes through the same ledger-isolated incremental publisher
+    # (usually a NOOP after per-slice pushes) with a whole-tree exact-set
+    # remote verification on top.
+    from ornix_dataset.publishing.incremental import push_tree
+    rep = push_tree(args.dataset, repo_id, args.state, revision="main",
+                    policy_path=args.policy, full_verify=True)
     log(args.state, {"event": "publish-done", "ok": rep.get("ok"),
                      "status": rep.get("status"), "reasons": rep.get("reasons"),
-                     "remote_commit_sha": rep.get("remote_commit_sha")})
+                     "pushed": rep.get("pushed"),
+                     "remote_commit_sha": rep.get("commit_sha")})
     return rep
 
 
 def cmd_run(args):
     man = load_manifest(args.manifest)
     defaults = man.get("defaults", {})
-    if args.chunk_rows is None:
-        args.chunk_rows = int(defaults.get("chunk_rows", 4000))
     if args.min_free_gib is None:
         args.min_free_gib = float(defaults.get("min_free_gib", 25))
     os.makedirs(args.state, exist_ok=True)
     os.makedirs(args.workdir, exist_ok=True)
+    datasets = man["datasets"]
+    if args.only:
+        wanted = set(args.only.split(","))
+        datasets = [d for d in datasets if d["name"] in wanted]
+    # Auto-tune to saturate the box: 0 means auto (GPU-aware). Explicit values
+    # are still honored. Caps go to os.environ (in-process stages read them at
+    # session creation) and are mirrored into env for legacy subprocess stages.
+    par = resolve_parallelism(len(datasets), args.workers, args.ort_threads)
+    args.workers = par["workers"]
+    args.ort_threads = par["ort_threads"]
+    if args.ingest_probe_workers and args.ingest_probe_workers > 0:
+        probe_workers = max(1, args.ingest_probe_workers)
+    else:
+        probe_workers = par["probe_workers"]
+    cap = str(max(1, args.ort_threads))
+    os.environ["ORNIX_ORT_INTRA_THREADS"] = cap
+    for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+              "NUMEXPR_NUM_THREADS"):
+        os.environ[v] = cap
+    os.environ["ORNIX_INGEST_PROBE_WORKERS"] = str(probe_workers)
+    # Bulk mode: per-row fsync dominates QC wall time and every campaign write
+    # is re-runnable (a crash only re-does tail rows, never corrupts). Explicit
+    # ORNIX_FSYNC_APPEND=1 restores fully durable appends.
+    os.environ.setdefault("ORNIX_FSYNC_APPEND", "0")
     env = dict(os.environ)
     try:
         import hf_transfer  # noqa: F401
         env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"  # faster bulk shard downloads
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
     except Exception:
         pass
     # Make GPU (CUDAExecutionProvider) usable when CUDA libs come from pip wheels
@@ -372,32 +585,42 @@ def cmd_run(args):
         if libdirs:
             existing = env.get("LD_LIBRARY_PATH", "")
             env["LD_LIBRARY_PATH"] = os.pathsep.join(libdirs + ([existing] if existing else []))
+            os.environ["LD_LIBRARY_PATH"] = env["LD_LIBRARY_PATH"]
     except Exception:
         pass
-    # CPU throughput: the ONNX detectors scale poorly with intra-op threads (a
-    # single qc process plateaus ~2 clips/s no matter the core count), so we run
-    # several dataset pipelines in parallel and cap each worker's thread pools to
-    # avoid oversubscribing the box. Canonical export serializes across workers on
-    # its own flock; only the checkpoint + progress log need the in-process lock.
-    if args.workers > 1:
-        cap = str(max(1, args.ort_threads))
-        env["ORNIX_ORT_INTRA_THREADS"] = cap
-        for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
-                  "NUMEXPR_NUM_THREADS"):
-            env[v] = cap
+    # Small ONNX models scale poorly with intra-op threads, so dataset pipelines
+    # run in parallel with capped per-worker pools. Canonical export serializes
+    # across workers on its own flock; only checkpoint + progress log need the
+    # in-process lock.
+    # Incremental push config: every N QC-processed files the tree diff is
+    # pushed (ledger-isolated: verified bytes are never re-pushed). Requires
+    # --publish (operator pre-authorization) + HF_TOKEN, like the final push.
+    push = None
+    if getattr(args, "publish", False):
+        dest = man.get("destination", {}) or {}
+        repo_id = args.publish_repo or dest.get("repo_id")
+        if not repo_id:
+            log(args.state, {"event": "push-skip", "reason": "no destination repo_id"})
+        elif not os.environ.get("HF_TOKEN"):
+            log(args.state, {"event": "push-skip", "reason": "no HF_TOKEN"})
+        else:
+            push = {"repo_id": repo_id, "every": max(0, args.push_every)}
     ckpt = load_ckpt(args.state)
-    datasets = man["datasets"]
-    if args.only:
-        wanted = set(args.only.split(","))
-        datasets = [d for d in datasets if d["name"] in wanted]
     log(args.state, {"event": "campaign-start", "datasets": [d["name"] for d in datasets],
-                     "chunk_rows": args.chunk_rows, "dataset_dir": args.dataset,
-                     "workers": args.workers, "ort_threads": args.ort_threads})
+                     "dataset_dir": args.dataset,
+                     "workers": args.workers, "ort_threads": args.ort_threads,
+                     "ingest_probe_workers": str(probe_workers),
+                     "loose_workers": args.loose_workers,
+                     "push_every": push["every"] if push else 0,
+                     "push_repo": push["repo_id"] if push else None,
+                     "cpu": par["cpu"], "gpu": par["gpu"],
+                     "inprocess": _inprocess_enabled(),
+                     "fsync": os.environ.get("ORNIX_FSYNC_APPEND", "1")})
     if args.workers > 1:
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            futs = {ex.submit(process_dataset, ds, defaults, args, ckpt, env): ds["name"]
-                    for ds in datasets}
+            futs = {ex.submit(process_dataset, ds, defaults, args, ckpt, env, push): ds["name"]
+                     for ds in datasets}
             for f in futs:
                 try:
                     f.result()
@@ -406,7 +629,7 @@ def cmd_run(args):
                                      "detail": str(e)[:300]})
     else:
         for ds in datasets:
-            process_dataset(ds, defaults, args, ckpt, env)
+            process_dataset(ds, defaults, args, ckpt, env, push)
             if getattr(args, "publish_each", False):
                 try:
                     auto_publish(man, args, env)
@@ -435,7 +658,8 @@ def cmd_status(args):
                "datasets": {}}
     for name, st in ckpt.get("datasets", {}).items():
         summary["datasets"][name] = {k: st.get(k) for k in
-                                     ("status", "chunks", "written", "exported", "blocked", "error")}
+                                     ("status", "written", "exported", "blocked",
+                                      "pushed", "error")}
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 
@@ -453,16 +677,24 @@ def main(argv=None):
     pr.add_argument("--policy", default=os.path.join(REPO, "configs/quality_policy.pilot.yaml"))
     pr.add_argument("--models-lock", default=os.path.join(REPO, "configs/models.lock.fpt.yaml"))
     pr.add_argument("--audio-profile", default=os.path.join(REPO, "configs/audio_profile.yaml"))
-    pr.add_argument("--chunk-rows", type=int, default=None)
     pr.add_argument("--min-free-gib", type=float, default=None)
     pr.add_argument("--only", default=None, help="comma-separated dataset names")
-    pr.add_argument("--max-chunks", type=int, default=0, help="cap chunks per dataset (0=all)")
-    pr.add_argument("--workers", type=int, default=1,
-                    help="dataset pipelines to run in parallel (CPU data-parallelism)")
-    pr.add_argument("--ort-threads", type=int, default=2,
-                    help="intra-op thread cap per worker when --workers>1 (also caps OMP/BLAS)")
+    pr.add_argument("--loose-workers", type=int, default=0,
+                    help="concurrent downloads for loose-format datasets (0=auto)")
+    pr.add_argument("--workers", type=int, default=0,
+                    help="dataset pipelines in parallel; 0=auto (GPU: ~cpu_count, "
+                         "CPU: ~cores/ort-threads, capped by dataset count)")
+    pr.add_argument("--ort-threads", type=int, default=0,
+                    help="intra-op thread cap per worker (also caps OMP/BLAS); "
+                         "0=auto (1 on GPU, 2 on CPU)")
+    pr.add_argument("--ingest-probe-workers", type=int, default=0,
+                    help="per-dataset threads for ingest ffprobe+sha256 (0=auto ~2*cores/workers)")
     pr.add_argument("--publish", action="store_true",
-                    help="after the campaign, finalize + auto-approve + push the canonical tree to HF")
+                    help="push the canonical tree to HF: incremental diff-push every "
+                         "--push-every processed files + final verified push")
+    pr.add_argument("--push-every", type=int, default=100,
+                    help="push the tree diff every N QC-processed files (0 = only "
+                         "push at dataset end / campaign end)")
     pr.add_argument("--publish-each", action="store_true",
                     help="publish the (growing) canonical tree after EACH dataset completes")
     pr.add_argument("--publish-repo", default=None,

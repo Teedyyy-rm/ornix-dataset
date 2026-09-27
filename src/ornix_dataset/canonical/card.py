@@ -35,7 +35,7 @@ ids, and exactly six metadata fields. Only clips that passed every quality gate
 
 ## Metadata schema (exactly 6 fields)
 ```json
-{{"audio": "audio/ab/ornix_ab....wav", "text": "...", "file_name": "audio/ab/ornix_ab....wav",
+{{"audio": "audio/01/Ornix_0000001.wav", "text": "...", "file_name": "audio/01/Ornix_0000001.wav",
   "speaker": "spk_....", "duration": 2.15, "language": "vi"}}
 ```
 | field | meaning |

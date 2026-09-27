@@ -78,15 +78,73 @@ def _effective_bandwidth(x: np.ndarray, sr: int) -> Optional[float]:
     return float(freqs[above[-1]])
 
 
+def _pre_probe_usable(pre_probed: Dict[str, Any], path: str) -> bool:
+    """Fail-closed guard for reusing an ingest-time probe.
+
+    Reuse only when the dict carries the header fields technical needs AND the
+    on-disk size still matches the recorded size (staged files are immutable,
+    but never trust — mismatch falls back to a fresh ffprobe).
+    """
+    try:
+        import os
+        size = pre_probed.get("size_bytes")
+        if size is None or int(size) <= 0:
+            return False
+        if os.path.getsize(path) != int(size):
+            return False
+        return pre_probed.get("codec_name") is not None
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def probe_info_for(path: str,
+                   pre_probed: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Resolve header metadata for ``path`` (ingest probe reuse or fresh ffprobe).
+
+    Raises DecodeError on probe failure. Extracted so callers can decode once
+    and evaluate on the buffer via run_technical_validation_on_buffer instead
+    of paying for a second decode inside run_technical_validation.
+    """
+    if pre_probed is not None and _pre_probe_usable(pre_probed, path):
+        return {
+            "codec_name": pre_probed.get("codec_name"),
+            "sample_rate": pre_probed.get("sample_rate"),
+            "channels": pre_probed.get("channels"),
+            "bits_per_raw_sample": pre_probed.get("bits_per_raw_sample"),
+            "sample_fmt": pre_probed.get("sample_fmt"),
+            "duration_s": pre_probed.get("duration_s"),
+            "format_name": pre_probed.get("format_name"),
+            "size_bytes": pre_probed.get("size_bytes"),
+        }
+    return ffprobe_info(path)
+
+
+def run_technical_validation_on_buffer(
+    buf: AudioBuffer,
+    info: Dict[str, Any],
+    thresholds: Optional[TechnicalThresholds] = None,
+    declared_duration_s: Optional[float] = None,
+) -> TechnicalReport:
+    """Evaluate an already-decoded buffer (no I/O, no second decode)."""
+    t = thresholds or TechnicalThresholds()
+    return _evaluate(buf, info, t, declared_duration_s, [])
+
+
 def run_technical_validation(
     path: str,
     thresholds: Optional[TechnicalThresholds] = None,
     declared_duration_s: Optional[float] = None,
+    pre_probed: Optional[Dict[str, Any]] = None,
 ) -> TechnicalReport:
+    import os as _os
+
+    from .decode import wav_only_enabled
     t = thresholds or TechnicalThresholds()
     reasons: List[str] = []
+    if wav_only_enabled() and _os.path.splitext(path)[1].lower() != ".wav":
+        return TechnicalReport(False, "REJECT_TECH", ["NON_WAV_SKIPPED"])
     try:
-        info = ffprobe_info(path)
+        info = probe_info_for(path, pre_probed)
     except DecodeError as e:
         return TechnicalReport(False, "ERROR", [f"PROBE_FAILED:{e}"])
     try:

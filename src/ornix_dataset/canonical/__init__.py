@@ -1,5 +1,5 @@
-"""Unified Ornix Dataset normalization: canonical 6-field metadata, opaque
-``ornix_<32hex>`` filenames, normalized speakers, and HF ``train/validation/test``
+"""Unified Ornix Dataset normalization: canonical 6-field metadata, sequential
+``Ornix_<digits>`` filenames, normalized speakers, and HF ``train/validation/test``
 layout. Built on top of the existing QC, rights, release and publish contracts."""
 
 from .bridge import (
@@ -47,11 +47,15 @@ from .publish import (
 from .schema import (
     AUDIO_PATH_RE,
     CANONICAL_FIELDS,
+    ORNIX_FILE_RE,
+    ORNIX_FILE_RE_LEGACY,
     ORNIX_ID_RE,
+    ORNIX_ID_RE_LEGACY,
     SPEAKER_RE,
     CanonicalRow,
     SchemaError,
     audio_path_for,
+    is_new_ornix_id,
     is_ornix_id,
     normalize_language,
 )
@@ -65,6 +69,9 @@ __all__ = [
     "METADATA_NAME",
     "ORNIX_ID_RE",
     "OrnixSample",
+    "ORNIX_FILE_RE",
+    "ORNIX_FILE_RE_LEGACY",
+    "ORNIX_ID_RE_LEGACY",
     "READY_NAME",
     "SPEAKER_RE",
     "SPLITS",
@@ -80,6 +87,7 @@ __all__ = [
     "export_run",
     "finalize_dataset",
     "internal_sample_key",
+    "is_new_ornix_id",
     "is_ornix_id",
     "iter_samples",
     "load_ornix_dataset",

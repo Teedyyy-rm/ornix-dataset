@@ -1,4 +1,4 @@
-"""Extract a page of an HF audio dataset into a local corpus (loose files + metadata.jsonl).
+"""Extract a whole HF audio dataset into a local corpus (loose files + metadata.jsonl).
 
 Normalizes THREE on-Hub layouts into the same local shape the LocalSourceAdapter
 understands, so the standard ingest/qc/canonical path can consume any of them:
@@ -7,10 +7,11 @@ understands, so the standard ingest/qc/canonical path can consume any of them:
   * ``arrow``   — audio bytes embedded in HF ``datasets`` .arrow shards
   * ``loose``   — loose audio files + a separate csv/jsonl transcript table
 
-It is PAGED and resumable: a call processes a bounded slice (by row-group / batch /
-file cursor) and prints a machine-readable ``RESULT {json}`` line with the next
-cursor and whether the source is exhausted. The orchestrator advances the cursor,
-running each page through QC and deleting it before fetching the next (disk-bounded).
+It extracts the WHOLE dataset in one pass and prints a machine-readable
+``RESULT {json}`` line when done. Parquet/arrow shards are still processed one
+shard at a time (download shard -> extract rows -> delete shard) so Hub-cache
+disk stays bounded; loose files are downloaded concurrently. The orchestrator
+runs the full extracted tree through QC once, then deletes it.
 
 Rights are declared by the operator downstream, never guessed here.
 """
@@ -117,11 +118,9 @@ def extract_parquet(args, api, fs):
     os.makedirs(tmp, exist_ok=True)
     meta = []
     written = 0
-    si = args.start_shard
-    # Shard-granular paging: each shard is bulk-downloaded, fully processed, then
-    # deleted (disk-bounded to one shard); --limit is a soft floor honored at the
-    # next shard boundary, so a shard is never re-downloaded across resume calls.
-    while si < len(shards):
+    # Whole-dataset pass: each shard is bulk-downloaded, fully processed, then
+    # deleted, so only one shard ever sits on disk at a time.
+    for si in range(len(shards)):
         local = _dl_shard(args.repo, shards[si], tmp)
         try:
             pf = pq.ParquetFile(local)
@@ -148,16 +147,9 @@ def extract_parquet(args, api, fs):
                 os.remove(local)
             except OSError:
                 pass
-        si += 1
-        if written >= args.limit:
-            shutil.rmtree(tmp, ignore_errors=True)
-            _write_meta(args.out, meta)
-            return {"written": written, "next_shard": si, "next_rg": 0,
-                    "exhausted": si >= len(shards), "sha": info.sha[:12]}
     shutil.rmtree(tmp, ignore_errors=True)
     _write_meta(args.out, meta)
-    return {"written": written, "next_shard": si, "next_rg": 0,
-            "exhausted": True, "sha": info.sha[:12]}
+    return {"written": written, "exhausted": True, "sha": info.sha[:12]}
 
 
 def extract_arrow(args, api, fs):
@@ -172,8 +164,9 @@ def extract_arrow(args, api, fs):
     os.makedirs(tmp, exist_ok=True)
     meta = []
     written = 0
-    si = args.start_shard
-    while si < len(shards):
+    # Whole-dataset pass: each shard is bulk-downloaded, fully processed, then
+    # deleted, so only one shard ever sits on disk at a time.
+    for si in range(len(shards)):
         local = _dl_shard(args.repo, shards[si], tmp)
         try:
             with open(local, "rb") as fh:
@@ -204,16 +197,9 @@ def extract_arrow(args, api, fs):
                 os.remove(local)
             except OSError:
                 pass
-        si += 1
-        if written >= args.limit:
-            shutil.rmtree(tmp, ignore_errors=True)
-            _write_meta(args.out, meta)
-            return {"written": written, "next_shard": si, "next_rg": 0,
-                    "exhausted": si >= len(shards), "sha": info.sha[:12]}
     shutil.rmtree(tmp, ignore_errors=True)
     _write_meta(args.out, meta)
-    return {"written": written, "next_shard": si, "next_rg": 0,
-            "exhausted": True, "sha": info.sha[:12]}
+    return {"written": written, "exhausted": True, "sha": info.sha[:12]}
 
 
 def _load_loose_meta(args):
@@ -253,7 +239,19 @@ def _load_loose_meta(args):
     return fmap
 
 
+def _loose_workers(args, n_files):
+    if getattr(args, "loose_workers", 0):
+        try:
+            w = max(1, int(args.loose_workers))
+            return min(w, n_files)
+        except (TypeError, ValueError):
+            pass
+    return min(max(4, (os.cpu_count() or 8)), n_files or 1)
+
+
 def extract_loose(args, api, fs):
+    from concurrent.futures import ThreadPoolExecutor
+
     from huggingface_hub import hf_hub_download
     info = api.dataset_info(args.repo, revision="main")
     pfx = args.loose_audio_prefix or ""
@@ -264,33 +262,34 @@ def extract_loose(args, api, fs):
         raise SystemExit(f"[FAIL] no loose audio under {pfx!r} in {args.repo}")
     fmap = _load_loose_meta(args)
     os.makedirs(args.out, exist_ok=True)
-    meta = []
-    written = 0
-    i = args.start_shard
-    while i < len(files) and written < args.limit:
-        rel = files[i]
+
+    def _one(idx_rel):
+        # Downloads are independent (distinct repo files) and hf_hub_download
+        # is thread-safe across distinct files; filenames derive from the repo
+        # path so concurrent writes never collide.
+        idx, rel = idx_rel
         src = hf_hub_download(args.repo, rel, repo_type="dataset")
         with open(src, "rb") as fh:
             blob = fh.read()
-        name = _uniq_name(rel, blob, i)
+        name = _uniq_name(rel, blob, idx)
         with open(os.path.join(args.out, name), "wb") as w:
             w.write(blob)
         txt = fmap.get(rel) or fmap.get(os.path.basename(rel))
-        meta.append(_meta_row(name, txt, args.language, args.speaker_ref))
-        written += 1
-        i += 1
+        return idx, _meta_row(name, txt, args.language, args.speaker_ref)
+
+    with ThreadPoolExecutor(max_workers=_loose_workers(args, len(files))) as ex:
+        rows = sorted(ex.map(_one, enumerate(files)), key=lambda t: t[0])
+    meta = [row for _, row in rows]
     _write_meta(args.out, meta)
-    return {"written": written, "next_shard": i, "next_rg": 0,
-            "exhausted": i >= len(files), "sha": info.sha[:12]}
+    return {"written": len(meta), "exhausted": True, "sha": info.sha[:12]}
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repo", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--format", choices=["parquet", "arrow", "loose"], default="parquet")
-    ap.add_argument("--limit", type=int, default=0, help="max clips this call (0 = no cap)")
-    ap.add_argument("--start-shard", type=int, default=0, help="resume cursor: shard/file index")
-    ap.add_argument("--start-rg", type=int, default=0, help="resume cursor: row-group/batch index")
+    ap.add_argument("--loose-workers", type=int, default=0,
+                    help="concurrent downloads for loose format (0=auto)")
     ap.add_argument("--audio-col", default="audio")
     ap.add_argument("--text-col", default="transcription")
     ap.add_argument("--language", default="vi")
@@ -302,8 +301,6 @@ def main(argv=None) -> int:
     ap.add_argument("--loose-meta-kind", choices=["csv", "jsonl"], default="csv")
     ap.add_argument("--file-col", default="file_name")
     args = ap.parse_args(argv)
-    if args.limit <= 0:
-        args.limit = 10 ** 12  # effectively unbounded
 
     from huggingface_hub import HfApi, HfFileSystem
     token = os.environ.get("HF_TOKEN")

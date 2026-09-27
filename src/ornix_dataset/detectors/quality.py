@@ -9,7 +9,7 @@ evidence, never as a music/overlap gate.
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -68,10 +68,7 @@ class DnsmosAdapter(QualityAdapter):
                            model_id="dnsmos-p835", weights_sha256=self.weights_sha256,
                            license="MIT-code")
 
-    def infer(self, mono: np.ndarray, sr: int) -> Dict[str, Any]:
-        if self._session is None:
-            return {"sig": None, "bak": None, "ovrl": None,
-                    "status": MeasurementStatus.UNKNOWN.value, "model_id": "dnsmos-p835"}
+    def _prepare_input(self, mono: np.ndarray, sr: int) -> np.ndarray:
         from .music_noise import _resample_to
 
         audio = _resample_to(mono, sr, self._SR) if sr != self._SR else mono.astype(np.float32)
@@ -79,11 +76,41 @@ class DnsmosAdapter(QualityAdapter):
         if len(audio) < need:  # tile short clips as the reference implementation does
             reps = int(np.ceil(need / max(1, len(audio))))
             audio = np.tile(audio, reps)
-        seg = audio[:need][None, :].astype(np.float32)
-        raw = np.asarray(self._session.run(None, {self._input_name: seg})[0]).reshape(-1)
+        return audio[:need][None, :].astype(np.float32)
+
+    @staticmethod
+    def _scores_from_raw(raw: np.ndarray) -> Dict[str, Any]:
+        raw = np.asarray(raw).reshape(-1)
         sig_raw, bak_raw, ovr_raw = float(raw[0]), float(raw[1]), float(raw[2])
-        sig = float(np.polyval(self._P_SIG, sig_raw))
-        bak = float(np.polyval(self._P_BAK, bak_raw))
-        ovrl = float(np.polyval(self._P_OVR, ovr_raw))
+        sig = float(np.polyval(DnsmosAdapter._P_SIG, sig_raw))
+        bak = float(np.polyval(DnsmosAdapter._P_BAK, bak_raw))
+        ovrl = float(np.polyval(DnsmosAdapter._P_OVR, ovr_raw))
         return {"sig": round(sig, 4), "bak": round(bak, 4), "ovrl": round(ovrl, 4),
                 "status": MeasurementStatus.OK.value, "model_id": "dnsmos-p835"}
+
+    def infer_batch(self, items: List[Any]) -> List[Dict[str, Any]]:
+        """Score several (mono, sr) segments with ONE session.run.
+
+        Same prep + same model as infer(), so results equal sequential infer()
+        calls (verified in tests). On a batch-run failure, falls back to
+        sequential infer() — identical failure semantics to before, never a
+        silent skip: an exception still propagates to per-file isolation.
+        """
+        if self._session is None:
+            return [{"sig": None, "bak": None, "ovrl": None,
+                     "status": MeasurementStatus.UNKNOWN.value,
+                     "model_id": "dnsmos-p835"} for _ in items]
+        batch = np.concatenate([self._prepare_input(m, s) for m, s in items], axis=0)
+        try:
+            raws = np.asarray(self._session.run(None, {self._input_name: batch})[0])
+        except Exception:
+            return [self.infer(m, s) for m, s in items]
+        return [self._scores_from_raw(r) for r in raws]
+
+    def infer(self, mono: np.ndarray, sr: int) -> Dict[str, Any]:
+        if self._session is None:
+            return {"sig": None, "bak": None, "ovrl": None,
+                    "status": MeasurementStatus.UNKNOWN.value, "model_id": "dnsmos-p835"}
+        seg = self._prepare_input(mono, sr)
+        raw = np.asarray(self._session.run(None, {self._input_name: seg})[0]).reshape(-1)
+        return self._scores_from_raw(raw)

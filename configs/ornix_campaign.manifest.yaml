@@ -23,7 +23,6 @@ destination:
 defaults:
   language: vi
   audio_col: audio
-  chunk_rows: 4000          # clips extracted + QC'd per chunk before cleanup
   min_free_gib: 25          # stop-safe: pause a dataset if free disk drops below this
 
 datasets:

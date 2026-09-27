@@ -23,11 +23,20 @@ from typing import Any, Dict, Optional
 
 CANONICAL_FIELDS = ("audio", "text", "file_name", "speaker", "duration", "language")
 
-# ornix_<32 lowercase hex>.wav, stored under audio/<first-2-hex>/
-ORNIX_FILE_RE = re.compile(r"^ornix_[0-9a-f]{32}\.wav$")
-ORNIX_ID_RE = re.compile(r"^ornix_[0-9a-f]{32}$")
+# Current scheme: Ornix_<zero-padded sequence>.wav (7 digits minimum, grows
+# past 7 digits past 9,999,999), sharded under audio/<last-2-digits>/.
+# Sequential ids shard evenly on the numeric suffix; prefix-sharding would pile
+# the first ~10k files into "00".
+ORNIX_FILE_RE = re.compile(r"^Ornix_[0-9]{7,}\.wav$")
+ORNIX_ID_RE = re.compile(r"^Ornix_[0-9]{7,}$")
+# Legacy scheme (files published before the sequential rename): still accepted
+# on every read/verify path so existing trees keep validating. New ids are
+# never allocated in this form.
+ORNIX_FILE_RE_LEGACY = re.compile(r"^ornix_[0-9a-f]{32}\.wav$")
+ORNIX_ID_RE_LEGACY = re.compile(r"^ornix_[0-9a-f]{32}$")
 SPEAKER_RE = re.compile(r"^spk_[0-9a-f]{32}$")
-AUDIO_PATH_RE = re.compile(r"^audio/[0-9a-f]{2}/ornix_[0-9a-f]{32}\.wav$")
+AUDIO_PATH_RE = re.compile(
+    r"^audio/[0-9a-f]{2}/(?:ornix_[0-9a-f]{32}|Ornix_[0-9]{7,})\.wav$")
 
 
 class SchemaError(ValueError):
@@ -51,15 +60,30 @@ def normalize_language(raw: Optional[str]) -> Optional[str]:
 
 
 def is_ornix_id(value: str) -> bool:
+    """Accepts current sequential ids and legacy hex ids (read paths)."""
+    v = value or ""
+    return bool(ORNIX_ID_RE.match(v) or ORNIX_ID_RE_LEGACY.match(v))
+
+
+def is_new_ornix_id(value: str) -> bool:
+    """True only for the current sequential ``Ornix_<digits>`` scheme."""
     return bool(ORNIX_ID_RE.match(value or ""))
 
 
 def audio_path_for(ornix_id: str) -> str:
-    """Repo-relative WAV path, sharded by the first two hex chars after ``ornix_``."""
-    if not is_ornix_id(ornix_id):
-        raise SchemaError(f"not an ornix id: {ornix_id!r}")
-    shard = ornix_id[len("ornix_"):][:2]
-    return f"audio/{shard}/{ornix_id}.wav"
+    """Repo-relative WAV path for either id scheme.
+
+    Sequential ids shard on the LAST TWO digits (even distribution);
+    legacy hex ids keep their original first-two-hex shard so already
+    published files keep resolving to their existing paths.
+    """
+    if ORNIX_ID_RE.match(ornix_id or ""):
+        digits = ornix_id[len("Ornix_"):]
+        return f"audio/{digits[-2:]}/{ornix_id}.wav"
+    if ORNIX_ID_RE_LEGACY.match(ornix_id or ""):
+        shard = ornix_id[len("ornix_"):][:2]
+        return f"audio/{shard}/{ornix_id}.wav"
+    raise SchemaError(f"not an ornix id: {ornix_id!r}")
 
 
 @dataclass

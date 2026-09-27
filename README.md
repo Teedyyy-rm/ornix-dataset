@@ -152,8 +152,9 @@ Statuses: `DRY_RUN`, `BLOCKED`, `UPLOAD_IN_PROGRESS`, `REMOTE_VERIFY_FAILED`,
 `canonical/` turns verified ACCEPT records from **many** datasets into one
 publishable Ornix Dataset with a single namespace:
 
-- every output file is `ornix_<32 lowercase hex>.wav`, sharded as
-  `audio/<first-2-hex>/…` — source filenames/dataset names never appear;
+- every output file is `Ornix_<zero-padded sequence>.wav` (e.g.
+  `Ornix_0000001.wav`), sharded as `audio/<last-2-digits>/…` — source
+  filenames/dataset names never appear;
 - training metadata has **exactly six fields** (`audio`, `text`, `file_name`,
   `speaker`, `duration`, `language`);
 - speaker ids are `spk_<opaque>`, mapped per source dataset+revision, so

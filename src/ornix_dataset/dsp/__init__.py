@@ -3,11 +3,13 @@
 from .admission import (AdmissionConfig, AdmissionReport, assess_source,
                         classify_lossy)
 from .audio import AudioBuffer
-from .decode import DecodeError, decode_to_float, ffprobe_info, probe_available
+from .decode import (DecodeError, decode_to_float, ffprobe_info, is_wav_path,
+                     probe_available, wav_only_enabled)
 from .resample import resample_poly_quality, resample_to
 from .render import (RenderRecipe, RenderVerificationError, render_canonical_wav,
                      verify_canonical_wav, write_wav_pcm16)
-from .technical import TechnicalReport, run_technical_validation
+from .technical import (TechnicalReport, probe_info_for, run_technical_validation,
+                        run_technical_validation_on_buffer)
 
 __all__ = [
     "AdmissionConfig",
@@ -18,7 +20,9 @@ __all__ = [
     "DecodeError",
     "decode_to_float",
     "ffprobe_info",
+    "is_wav_path",
     "probe_available",
+    "wav_only_enabled",
     "resample_poly_quality",
     "resample_to",
     "RenderRecipe",
@@ -27,5 +31,7 @@ __all__ = [
     "verify_canonical_wav",
     "write_wav_pcm16",
     "TechnicalReport",
+    "probe_info_for",
     "run_technical_validation",
+    "run_technical_validation_on_buffer",
 ]

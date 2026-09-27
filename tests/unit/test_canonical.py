@@ -26,7 +26,7 @@ from ornix_dataset.canonical.layout import SPLITS, metadata_path
 from ornix_dataset.canonical.schema import CanonicalRow
 from ornix_dataset.util.hashing import sha256_file
 
-WAV_RE = re.compile(r"^ornix_[0-9a-f]{32}\.wav$")
+WAV_RE = re.compile(r"^Ornix_[0-9]{7,}\.wav$")
 
 
 def make_sample(root, name="a.wav", *, text="xin chào thế giới", lang="vi",
@@ -211,8 +211,9 @@ def test_t10_t11_paths_present_no_orphan_dangling_duplicate(tmp_path):
 def test_orphan_and_dangling_detected(tmp_path):
     normalize(tmp_path, [make_sample(tmp_path)])
     ds = tmp_path / "ds"
-    # orphan: a stray wav with no metadata row
-    stray = ds / "train" / "audio" / "zz" / f"ornix_{'f' * 32}.wav"
+    # orphan: a stray wav with no metadata row (number far past the
+    # single normalized sample so it cannot collide with a real file)
+    stray = ds / "train" / "audio" / "99" / "Ornix_0000099.wav"
     stray.parent.mkdir(parents=True, exist_ok=True)
     synth.write_wav(str(stray), synth.speechlike(24000, 1.0, seed=9), 24000)
     res = verify_canonical_dataset(str(ds))

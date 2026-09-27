@@ -22,7 +22,14 @@ from ornix_dataset.dsp.render import render_canonical_wav, verify_canonical_wav
 from ornix_dataset.util.hashing import sha256_file
 
 pytestmark = pytest.mark.skipif(shutil.which("ffmpeg") is None,
-                                reason="ffmpeg required for real codec admission tests")
+                                 reason="ffmpeg required for real codec admission tests")
+
+
+@pytest.fixture(autouse=True)
+def _allow_transcode(monkeypatch):
+    # These tests intentionally exercise the legacy mp3/aac/alac/opus
+    # transcode path; production defaults to ORNIX_WAV_ONLY=1 (skip non-WAV).
+    monkeypatch.setenv("ORNIX_WAV_ONLY", "0")
 
 
 def _wav(tmp_path, sr=44100, dur=2.0):

@@ -7,7 +7,7 @@ Public tree (nothing else is published)::
         MANIFEST.sha256
         RELEASE_READY.json
         train/metadata.jsonl
-        train/audio/<first-2-hex>/ornix_<32hex>.wav
+        train/audio/<shard>/Ornix_<digits>.wav
         validation/...
         test/...
 
@@ -139,10 +139,28 @@ def write_manifest_sha(dataset_dir: str) -> str:
 
 def write_ready(dataset_dir: str, stats: Dict[str, Any],
                 rights: Dict[str, Any]) -> str:
+    out = os.path.join(dataset_dir, READY_NAME)
+    # Stable bytes when nothing meaningful changed: preserving the existing
+    # timestamp keeps MANIFEST/release digests (and the push ledger) quiet on
+    # re-finalize, so an unchanged tree converges to zero new bytes instead of
+    # re-pushing READY + MANIFEST on every pass.
+    generated = utc_now_iso()
+    try:
+        if os.path.exists(out):
+            with open(out, "r", encoding="utf-8") as fh:
+                prior = json.load(fh)
+            if (prior.get("n_rows") == stats["n_rows"]
+                    and prior.get("by_split") == stats["by_split"]
+                    and prior.get("languages") == stats["languages"]
+                    and prior.get("n_speakers") == stats["n_speakers"]
+                    and prior.get("rights") == rights
+                    and prior.get("generated_utc")):
+                generated = prior["generated_utc"]
+    except (OSError, ValueError):
+        pass
     payload = {"dataset": "Ornix-Datasets", "ready": True,
-               "generated_utc": utc_now_iso(), "n_rows": stats["n_rows"],
+               "generated_utc": generated, "n_rows": stats["n_rows"],
                "by_split": stats["by_split"], "languages": stats["languages"],
                "n_speakers": stats["n_speakers"], "rights": rights}
-    out = os.path.join(dataset_dir, READY_NAME)
     write_json(out, payload)
     return out

@@ -33,7 +33,8 @@ def test_render_48k_to_canonical_verifies(tmp_path):
     assert len(sha) == 64
 
 
-def test_t5_flac_24k_identity(tmp_path):
+def test_t5_flac_24k_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv("ORNIX_WAV_ONLY", "0")  # legacy transcode path under test
     src = str(tmp_path / "s.flac")
     sf.write(src, synth.speechlike(24000, 2.0), 24000, subtype="PCM_16", format="FLAC")
     buf, _ = decode_to_float(src, mono=True)

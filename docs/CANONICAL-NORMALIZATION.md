@@ -28,16 +28,21 @@ audit state (`canonical/identity.py`).
 
 ## 2. Filename & stable identity
 
-- Every output WAV is `ornix_<32 lowercase hex>.wav`, stored at
-  `audio/<first-2-hex>/ornix_<32hex>.wav`.
+- Every output WAV is `Ornix_<zero-padded sequence>.wav` (e.g.
+  `Ornix_0000001.wav`), stored at `audio/<last-2-digits>/Ornix_<digits>.wav`.
+  Sharding on the numeric suffix spreads sequential ids evenly across shards.
 - The id is **not** derived from the source filename, dataset name, download
-  order, batch index, timestamp or a per-dataset counter.
+  order, batch index or timestamp. New ids come from one persistent
+  `file_seq` counter in the canonical state (crash-safe: gaps possible,
+  duplicates impossible).
 - Internal key: `("ornix-canonical-state-v1", revision, source_id,
   source_sha256, segment_start_sample, segment_end_sample)` — it distinguishes
   source revision, file/shard and segment identity.
 - The mapping `internal key -> ornix_id` is persisted (atomic write, `flock`
   single-writer) **before** publish; an existing mapping is reused on
-  retry/resume; a new id is `uuid4` with a collision check.
+  retry/resume. Files published under the legacy `ornix_<32 hex>` scheme keep
+  validating (read paths accept both schemes); only new ids use the
+  sequential form.
 - If an output path already exists, content identity is checked: identical → reuse,
   different → hard `CONTENT_IDENTITY_CONFLICT` (audio is never overwritten).
 
@@ -59,7 +64,7 @@ Ornix-Datasets/
     MANIFEST.sha256
     RELEASE_READY.json
     train/metadata.jsonl
-    train/audio/<2hex>/ornix_<32hex>.wav
+    train/audio/<shard>/Ornix_<digits>.wav
     validation/...
     test/...
 ```
@@ -115,7 +120,7 @@ when file count makes it necessary, and then require a verified loader.
 
 `tests/unit/test_canonical.py` (T1–T15 + resume/unknown-split) and
 `tests/integration/test_canonical_e2e.py` (T5/T6/T16/T17/T18 + incremental
-upload) cover: exact six fields and types; `ornix_<32hex>.wav` naming; no source
+upload) cover: exact six fields and types; `Ornix_<digits>.wav` naming; no source
 name in output; two datasets with the same filename; retry/resume stability
 (including recreating a dropped output with the *same* id); out-of-order workers
 without duplicates; stable speaker mapping and no false merge; duration equals

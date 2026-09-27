@@ -12,7 +12,6 @@ from . import __version__
 from .audit.events import AuditLog
 from .audit.reports import build_funnel_report
 from .config import (
-    build_detectors,
     build_gate_and_adapters,
     load_policy_config,
     source_admission_config,
@@ -56,7 +55,10 @@ def cmd_sources_validate(args) -> int:
 
 def _build_pipeline(args) -> OrnixPipeline:
     policy = load_policy_config(args.policy)
-    detectors = build_detectors(getattr(args, "models_lock", None))
+    # Persistent model server: detectors (ONNX sessions) are loaded once per
+    # process and reused across calls — no per-chunk reload + sha re-verify.
+    from .detectors.model_server import get_detectors
+    detectors = get_detectors(getattr(args, "models_lock", None))
     tech = technical_thresholds(getattr(args, "audio_profile", None))
     admission = source_admission_config(getattr(args, "audio_profile", None))
     return OrnixPipeline(args.workdir, policy, tech=tech, admission=admission,
@@ -81,6 +83,29 @@ def cmd_ingest(args) -> int:
     return 0
 
 
+def qc_records(pipe, records, paths, audit):
+    """QC a list of SourceRecords into paths (evidence/accepted files + result).
+
+    Split-agnostic core shared by cmd_qc and the campaign's per-N slicer; the
+    caller owns manifest reset, split finalization and funnel reporting.
+    """
+    from .pipeline import AnalyzeResult
+
+    combined = AnalyzeResult()
+    for rec in records:
+        res = pipe.analyze_source(rec, paths, audit)
+        combined.evidences.extend(res.evidences)
+        combined.accepted.extend(res.accepted)
+    return combined
+
+
+def write_qc_funnel(combined, paths):
+    """Write QC_FUNNEL.json for a combined result; returns the funnel dict."""
+    funnel = build_funnel_report(e.to_dict() for e in combined.evidences)
+    write_json(os.path.join(paths.root, "QC_FUNNEL.json"), funnel)
+    return funnel
+
+
 def cmd_qc(args) -> int:
     paths = RunPaths.create(args.workdir, args.run_id)
     if not os.path.exists(paths.source_manifest):
@@ -92,17 +117,11 @@ def cmd_qc(args) -> int:
             os.remove(p)
     pipe = _build_pipeline(args)
     audit = AuditLog(paths.audit, run_id=args.run_id)
-    from .pipeline import AnalyzeResult
-
-    combined = AnalyzeResult()
-    for rec in read_jsonl(paths.source_manifest):
-        src = SourceRecord.from_dict(rec)
-        res = pipe.analyze_source(src, paths, audit)
-        combined.evidences.extend(res.evidences)
-        combined.accepted.extend(res.accepted)
+    records = [SourceRecord.from_dict(rec)
+               for rec in read_jsonl(paths.source_manifest)]
+    combined = qc_records(pipe, records, paths, audit)
     pipe._finalize_splits(combined, paths, audit)
-    funnel = build_funnel_report(e.to_dict() for e in combined.evidences)
-    write_json(os.path.join(paths.root, "QC_FUNNEL.json"), funnel)
+    funnel = write_qc_funnel(combined, paths)
     _print({"run_id": args.run_id, "candidates": len(combined.evidences),
             "accepted": len(combined.accepted), "funnel": funnel})
     return 0

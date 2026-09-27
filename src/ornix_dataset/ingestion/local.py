@@ -13,13 +13,22 @@ from typing import Any, Dict, Iterator, Optional
 from ..contracts.enums import IngestStatus, RightsStatus
 from ..contracts.source import SourceRecord
 from ..dsp.admission import AdmissionConfig, classify_lossy, _rate_class
-from ..dsp.decode import DecodeError, ffprobe_info
+from ..dsp.decode import DecodeError, ffprobe_info, wav_only_enabled
 from ..util.hashing import sha256_file, short_id
 from ..util.timeutil import utc_now_iso
 from .base import SourceAdapter
 from .permissions import PermissionGate
 
 AUDIO_EXTS = {".wav", ".flac", ".mp3", ".ogg", ".opus", ".m4a", ".aac", ".wv"}
+
+# wav-only fast path (default on): non-WAV sources are never probed, hashed or
+# staged — transcoding them costs a full decode per file. Set ORNIX_WAV_ONLY=0
+# to restore the legacy multi-format scan.
+WAV_ONLY_EXTS = {".wav"}
+
+
+def wanted_exts():
+    return WAV_ONLY_EXTS if wav_only_enabled() else AUDIO_EXTS
 
 
 class LocalSourceAdapter(SourceAdapter):
@@ -36,12 +45,33 @@ class LocalSourceAdapter(SourceAdapter):
     def scan(self) -> Iterator[SourceRecord]:
         if not os.path.isdir(self.root):
             raise FileNotFoundError(f"source root not found: {self.root}")
+        exts = wanted_exts()
+        paths = []
         for dirpath, _dirs, files in os.walk(self.root):
             for fn in sorted(files):
                 ext = os.path.splitext(fn)[1].lower()
-                if ext not in AUDIO_EXTS:
+                if ext not in exts:
                     continue
-                yield self._record(os.path.join(dirpath, fn))
+                paths.append(os.path.join(dirpath, fn))
+        # Per-file _record cost is dominated by a per-file ffprobe subprocess plus a
+        # full-file sha256 read — both release the GIL, so a thread pool overlaps them
+        # across otherwise-idle cores. ThreadPoolExecutor.map preserves input order, so
+        # the emitted record sequence (and thus manifest order) is identical to the
+        # sequential path. 0/unset = auto (~2x cores). Set =1 for exact legacy behavior.
+        try:
+            workers = int(os.environ.get("ORNIX_INGEST_PROBE_WORKERS", "0") or 0)
+        except ValueError:
+            workers = 0
+        if workers <= 0:
+            workers = max(2, 2 * (os.cpu_count() or 8))
+        if workers <= 1 or len(paths) <= 1:
+            for p in paths:
+                yield self._record(p)
+            return
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(workers, len(paths))) as ex:
+            for rec in ex.map(self._record, paths):
+                yield rec
 
     def _record(self, path: str) -> SourceRecord:
         rel = os.path.relpath(path, self.root)

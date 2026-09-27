@@ -37,8 +37,11 @@ def finalize_dataset(dataset_dir: str, rights: Optional[Dict[str, Any]] = None,
     if stats["n_rows"] == 0:
         return {"ok": False, "reason": "no-rows"}
     card.write_card(dataset_dir, stats, rights, changelog)
-    layout.write_manifest_sha(dataset_dir)
+    # READY before MANIFEST: the checksum manifest must cover the readiness
+    # marker itself, otherwise the first finalize produces a manifest that
+    # differs from every later one (READY missing) and digests never converge.
     layout.write_ready(dataset_dir, stats, rights)
+    layout.write_manifest_sha(dataset_dir)
     return {"ok": True, **stats}
 
 

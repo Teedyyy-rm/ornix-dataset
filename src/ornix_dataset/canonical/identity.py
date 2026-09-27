@@ -3,23 +3,26 @@
 Two mappings are persisted **outside** the public tree (they are provenance and
 MUST NOT be published):
 
-- ``stable_internal_sample_key -> ornix_id``  (opaque ``ornix_<32 hex>``)
+- ``stable_internal_sample_key -> ornix_id``  (sequential ``Ornix_<digits>``;
+  pre-rename files keep their legacy ``ornix_<32 hex>`` ids)
 - ``source speaker identity -> spk_<32 hex>``
 
 and an internal provenance record per ``ornix_id`` for audit/takedown.
 
 Identity rules:
 - The internal sample key distinguishes source revision, file/shard and segment
-  identity — it never uses filename order, batch index, timestamp or a
-  per-dataset counter.
-- An existing mapping is reused on retry/resume; a new opaque id is allocated
-  (uuid4) with a collision check and persisted **before** any publish.
+  identity — it never uses filename order, batch index or timestamp.
+- An existing mapping is reused on retry/resume; a NEW sample takes the next
+  number from a persistent ``file_seq`` counter (``Ornix_0000001``,
+  ``Ornix_0000002``, …), allocated under the state lock and committed with its
+  provenance **before** any publish. A crash between allocate and commit can
+  skip a number (gap) but never duplicate one.
 - Two datasets that both name a speaker ``speaker_01`` do NOT merge: the
   speaker key is scoped by the source identity. An unverified speaker (no
   trusted ref) gets a unique per-sample id — never merged.
 
 A single logical writer is enforced with an advisory ``flock`` so concurrent
-workers cannot clobber the maps or the metadata (spec §7).
+workers cannot clobber the maps, the counter or the metadata (spec §7).
 """
 
 from __future__ import annotations
@@ -96,12 +99,15 @@ class CanonicalState:
     def _load(self) -> Dict[str, Any]:
         if not os.path.exists(self.path):
             return {"schema": IDENTITY_SCHEMA, "ids": {}, "speakers": {},
-                    "provenance": {}}
+                    "provenance": {}, "file_seq": 1}
         data = read_json(self.path)
         if data.get("schema") != IDENTITY_SCHEMA:
             raise ValueError(f"unknown canonical state schema: {data.get('schema')}")
         for k in ("ids", "speakers", "provenance"):
             data.setdefault(k, {})
+        # Pre-rename states have no counter; the sequential namespace cannot
+        # collide with legacy hex ids, so starting at 1 is safe.
+        data.setdefault("file_seq", 1)
         return data
 
     def commit(self) -> None:
@@ -111,13 +117,25 @@ class CanonicalState:
     def _taken_ids(self) -> set:
         return {v["ornix_id"] for v in self.data["ids"].values()}
 
+    def _next_sequential_id(self) -> str:
+        """Allocate the next ``Ornix_<digits>`` id from the persistent counter.
+
+        Must be called under the state lock. Gaps may occur on crash (counter
+        is committed with provenance, after allocation); duplicates cannot.
+        """
+        taken = self._taken_ids()
+        while True:
+            candidate = f"Ornix_{self.data['file_seq']:07d}"
+            self.data["file_seq"] += 1
+            if candidate not in taken:
+                return candidate
+
     def ornix_id_for(self, key: str, audio_sha256: str,
                      uuid_factory: Callable[[], uuid.UUID] = uuid.uuid4) -> str:
         entry = self.data["ids"].get(key)
         if entry is not None:
             return entry["ornix_id"]
-        taken = self._taken_ids()
-        new_id = _new_opaque("ornix_", lambda c: c in taken, uuid_factory)
+        new_id = self._next_sequential_id()
         self.data["ids"][key] = {"ornix_id": new_id,
                                  "audio_sha256": audio_sha256,
                                  "created_utc": utc_now_iso()}

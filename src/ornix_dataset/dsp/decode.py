@@ -5,6 +5,7 @@ soundfile when possible and falls back to an ffmpeg pipe (spec §4 Decode/probe)
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from typing import Any, Dict, Optional, Tuple
@@ -16,6 +17,22 @@ from .audio import AudioBuffer
 
 class DecodeError(Exception):
     pass
+
+
+def wav_only_enabled() -> bool:
+    """True when non-WAV inputs must be skipped without transcode.
+
+    Transcoding mp3/flac/m4a/ogg -> wav costs a full ffmpeg/soundfile decode
+    per file. With the default "1", callers fast-reject non-WAV inputs before
+    any decode. Set ORNIX_WAV_ONLY=0 to restore the legacy transcode path
+    (needed by the codec-admission tests).
+    """
+    v = os.environ.get("ORNIX_WAV_ONLY", "1").strip().lower()
+    return v not in ("0", "false", "no", "off", "")
+
+
+def is_wav_path(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() == ".wav"
 
 
 def probe_available() -> bool:
@@ -62,6 +79,10 @@ def decode_to_float(
     path: str, mono: bool = False, timeout: float = 120.0
 ) -> Tuple[AudioBuffer, str]:
     """Decode to float32 samples in [-1, 1]. Returns (buffer, decoder_name)."""
+    if wav_only_enabled() and not is_wav_path(path):
+        raise DecodeError(
+            f"NON_WAV_SKIPPED:{os.path.splitext(path)[1] or '(no ext)'} "
+            "(wav-only mode; set ORNIX_WAV_ONLY=0 to allow transcode)")
     try:
         import soundfile as sf  # optional dep
 
