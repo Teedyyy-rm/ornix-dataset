@@ -23,6 +23,7 @@ from .downloading import (
     read_manifest,
     run_batch,
 )
+from .parquet import expand_batch_parquet, is_parquet_path
 from .processing import (
     gate_batch_release,
     gate_receipt_path,
@@ -30,6 +31,7 @@ from .processing import (
     qc_done_files,
     qc_paths,
     qc_run_id,
+    qc_workers,
     run_qc_batch,
 )
 from .publishing import (
@@ -102,11 +104,13 @@ __all__ = [
     "downloaded_files",
     "dry_run_plan",
     "eligibility",
+    "expand_batch_parquet",
     "expected_upload_bytes",
     "fetch_job_inventory",
     "gate_batch_release",
     "gate_receipt_path",
     "is_full_sha",
+    "is_parquet_path",
     "list_releases",
     "load_receipt",
     "manifest_archive_path",
@@ -124,6 +128,7 @@ __all__ = [
     "qc_done_files",
     "qc_paths",
     "qc_run_id",
+    "qc_workers",
     "read_manifest",
     "receipt_path_for",
     "record_path_for",

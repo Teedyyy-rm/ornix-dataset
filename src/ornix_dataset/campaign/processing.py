@@ -57,6 +57,8 @@ def manifest_to_source_record(row: Dict[str, Any], job: Any,
     Identity rule (campaign-local, documented): source_id derives from the
     MEASURED staged content sha — the same rule HfSourceAdapter uses when a
     remote blob sha exists, but stable even when the Hub gives none.
+    Transcript/language ride along when the row carries them (parquet
+    expansion); otherwise they stay None (UNKNOWN downstream, fail-closed).
     """
     sha = row["sha256"]
     uri = row["source_uri"]
@@ -66,7 +68,27 @@ def manifest_to_source_record(row: Dict[str, Any], job: Any,
         original_file_id=row["original_file_id"],
         source_sha256=sha, source_bytes=int(row.get("size", 0)),
         staged_path=os.path.join(staging_dir, row.get("staged_path", "")),
+        source_transcript=row.get("source_transcript"),
+        source_language=row.get("source_language") or "vi",
+        source_speaker_ref=row.get("source_speaker_ref"),
         ingestion_timestamp_utc=utc_now_iso())
+
+
+def qc_workers() -> int:
+    """QC thread count: ORNIX_QC_WORKERS or 6 on an 8-core box.
+
+    CPU-bound DSP work scales near-linearly; leave 2 cores for download,
+    I/O and the OS. Capped at 16, floored at 1. Set to 1 for exact legacy
+    sequential behavior.
+    """
+    try:
+        explicit = int(os.environ.get("ORNIX_QC_WORKERS", "0") or 0)
+    except ValueError:
+        explicit = 0
+    if explicit > 0:
+        return max(1, min(explicit, 16))
+    cores = os.cpu_count() or 8
+    return max(2, min(6, max(1, cores - 2)))
 
 
 def qc_done_files(store: Any, batch: Any) -> List[str]:
@@ -96,6 +118,16 @@ def run_qc_batch(store: Any, job_id: str, batch_id: str,
     rows = read_manifest(staging)
     if not rows:
         return {"ok": False, "reason": "no-manifest"}
+    # Parquet containers expand in place first (bounded: clip rows append to
+    # the same manifest; the parquet itself stays until batch cleanup).
+    # After this point the manifest holds only audio rows + the parquet
+    # parents (skipped below, never QCed directly).
+    try:
+        from .parquet import expand_batch_parquet, is_parquet_path
+        expand_rep = expand_batch_parquet(store, job, batch, staging)
+        rows = read_manifest(staging)
+    except Exception as e:
+        return {"ok": False, "reason": f"parquet-expand-failed: {e}"}
     paths = qc_paths(store, job.job_id, batch.batch_id, workdir)
     audit = AuditLog(paths.audit, run_id=qc_run_id(job.job_id, batch.batch_id))
     ckpt = store.batch_checkpoint(batch)
@@ -103,32 +135,118 @@ def run_qc_batch(store: Any, job_id: str, batch_id: str,
 
     accepted: List[Dict[str, Any]] = []
     n_shard_blocked = 0
+    n_extracted_clips = int((expand_rep or {}).get("n_clips_added", 0) or 0)
+    failed_parquet = {r.get("original_file_id")
+                      for r in ((expand_rep or {}).get("reports") or [])
+                      if not r.get("ok")}
     pending: List[str] = []
+    todo: List[Dict[str, Any]] = []
     for row in rows:
         fid = row["original_file_id"]
         if fid in done:
             continue
-        ext = os.path.splitext(fid)[1].lower()
+        base = fid.split("#")[0]
+        is_clip = "#row-" in fid
+        if is_parquet_path(base) and not is_clip:
+            # Parent container: never raw-QC it. Expanded parents retire
+            # silently (their clips carry the QC); failed ones are blockers
+            # with evidence, exactly like other unsupported containers.
+            if fid in failed_parquet:
+                reason = next((r.get("reason", "extract-failed")
+                               for r in ((expand_rep or {}).get("reports") or [])
+                               if r.get("original_file_id") == fid),
+                              "extract-failed")
+                append_jsonl(paths.evidence, {
+                    "source_uri": row["source_uri"], "decision": "BLOCKED",
+                    "reason": f"parquet container not expandable: {reason}"})
+                ckpt.mark(fid, "SHARD_BLOCKED", reason=reason)
+                audit.emit("qc_shard_blocked", fid, ext=".parquet")
+                n_shard_blocked += 1
+            elif fid not in done:
+                ckpt.mark(fid, "QC_DONE")
+            continue
+        # Extracted clip rows carry the parquet path as a prefix; their real
+        # container comes from the staged file, not the parent name.
+        if is_clip:
+            ext = os.path.splitext(row.get("staged_path", ""))[1].lower()
+        else:
+            ext = os.path.splitext(base)[1].lower()
         if ext not in AUDIO_EXTS:
-            # No wired extractor for container shards: blocker, never raw QC.
+            # Unknown container: blocker, never raw QC.
             append_jsonl(paths.evidence, {
                 "source_uri": row["source_uri"], "decision": "BLOCKED",
-                "reason": f"unsupported shard container {ext or '(no ext)'}; "
-                          f"needs a verified extractor (see plan R1/MD-004)"})
+                "reason": f"unsupported shard container {ext or '(no ext)'}"})
             ckpt.mark(fid, "SHARD_BLOCKED", reason="unsupported-container")
             audit.emit("qc_shard_blocked", fid, ext=ext)
             n_shard_blocked += 1
             continue
+        todo.append(row)
+
+    def _analyze_isolated(row: Dict[str, Any]) -> Dict[str, Any]:
+        """Run one file with isolated temp evidence/audit; merge later.
+
+        The analyzer appends to the paths it is given, so each worker gets
+        private temp files sharing only the canonical dir (unique seg ids —
+        no collisions). The main thread replays results in input order, so
+        output order is identical to the sequential path.
+        """
+        import tempfile
         src = manifest_to_source_record(row, job, staging)
+        tmpdir = tempfile.mkdtemp(prefix="qc-one-")
+        tmpev = os.path.join(tmpdir, "evidence.jsonl")
+        tmpac = os.path.join(tmpdir, "accepted.jsonl")
+        tmpau = os.path.join(tmpdir, "audit.jsonl")
+        shim = RunPaths(root=tmpdir, source_manifest="",
+                        evidence=tmpev, accepted=tmpac,
+                        review="", audit=tmpau,
+                        canonical_dir=paths.canonical_dir)
+        tmp_audit = AuditLog(tmpau, run_id=qc_run_id(job.job_id, batch.batch_id))
         try:
-            res = analyzer(src, paths, audit)
-        except Exception as e:  # per-file isolation: one bad file ≠ dead batch
-            ckpt.mark(fid, "QC_ERROR", error=str(e))
-            audit.emit("qc_error", fid, error=str(e))
+            res = analyzer(src, shim, tmp_audit)
+        except Exception as e:
+            return {"ok": False, "fid": row["original_file_id"],
+                    "error": str(e)}
+        evs = [e.to_dict() if hasattr(e, "to_dict") else dict(e)
+               for e in (getattr(res, "evidences", None) or [])]
+        accs = [a.to_dict() if hasattr(a, "to_dict") else dict(a)
+                for a in (getattr(res, "accepted", None) or [])]
+        au_events = load_jsonl(tmpau)
+        try:
+            import shutil as _sh
+            _sh.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+        return {"ok": True, "fid": row["original_file_id"],
+                "evidences": evs, "accepted": accs, "audit": au_events}
+
+    workers = qc_workers()
+    ordered: List[Dict[str, Any]] = [{}] * len(todo)
+    if todo and workers > 1 and len(todo) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(
+                max_workers=min(workers, len(todo))) as ex:
+            for i, rep in enumerate(ex.map(_analyze_isolated, todo)):
+                ordered[i] = rep
+    else:
+        ordered = [_analyze_isolated(r) for r in todo]
+    for row, rep in zip(todo, ordered):
+        fid = row["original_file_id"]
+        if not rep.get("ok"):
+            ckpt.mark(fid, "QC_ERROR", error=str(rep.get("error", "?")))
+            audit.emit("qc_error", fid, error=str(rep.get("error", "?")))
             pending.append(fid)
             continue
-        for acc in (getattr(res, "accepted", None) or []):
-            accepted.append(acc.to_dict() if hasattr(acc, "to_dict") else dict(acc))
+        for ev in rep.get("evidences", []):
+            append_jsonl(paths.evidence, ev)
+        for ac in rep.get("accepted", []):
+            accepted.append(ac)
+        for evt in rep.get("audit", []):
+            # Re-emit for a global sequence; keeps ts/subject/payload.
+            audit.emit(str(evt.get("event", "qc_event")),
+                       str(evt.get("subject", fid)),
+                       **{k: v for k, v in evt.items()
+                          if k not in ("seq", "ts_utc", "run_id",
+                                       "event", "subject")})
         ckpt.mark(fid, "QC_DONE")
     # atomic accepted snapshot for this batch (the gate reads these files)
     prev = load_jsonl(os.path.join(paths.root, "BATCH_ACCEPTED.jsonl"))
@@ -146,6 +264,8 @@ def run_qc_batch(store: Any, job_id: str, batch_id: str,
     n_evidence = len(load_jsonl(paths.evidence))
     summary = {"n_files": len(rows), "n_evidence": n_evidence,
                "n_accepted": len(merged), "n_shard_blocked": n_shard_blocked,
+               "n_extracted_clips": n_extracted_clips,
+               "qc_workers": workers,
                "pending": still_pending}
     complete = not summary["pending"]
     if complete:
