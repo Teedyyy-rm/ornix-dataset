@@ -1,0 +1,23 @@
+# Benchmark campaign: ThanhPahm-TTS only, one parquet shard per batch.
+# Extends configs/ornix_campaign.manifest.yaml (rights copied verbatim).
+#
+# Why max_files_per_batch=1: a batch is the unit of disk residency. With one
+# shard per batch plus --verify-workers 1, exactly one parquet container is
+# on disk at a time; each is unpacked and unlinked before the next arrives.
+destination:
+  repo_id: Teedyyy-rm/Ornix-Datasets
+  repo_type: dataset
+
+defaults:
+  language: vi
+  audio_col: audio
+  min_free_gib: 25
+
+datasets:
+  - name: thanhpahm_tts
+    repo: toandev/ThanhPahm-TTS
+    format: parquet
+    parquet_prefix: data
+    text_col: transcription
+    speaker: {mode: fixed, ref: thanh_pham}
+    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: CC-BY-NC-SA-4.0, note: "ThanhPahm-TTS CC-BY-NC-SA-4.0; attribution + NC + share-alike"}

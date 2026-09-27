@@ -569,6 +569,7 @@ def cmd_campaign_pump(args) -> int:
         gate_batch_release,
         prepare_release,
         publish_release,
+        pump_campaign,
         run_batch,
         run_qc_batch,
     )
@@ -597,7 +598,10 @@ def cmd_campaign_pump(args) -> int:
         if not pf.get("ok"):
             _print({"refused": "destination preflight", "preflight": pf})
             return 3
-    cfg = DownloadConfig(file_workers=args.workers)
+    # verify_workers also caps how many files are RESIDENT (staged) at once;
+    # for parquet shards set it to 1 so exactly one container lives on disk.
+    cfg = DownloadConfig(file_workers=args.workers,
+                         verify_workers=args.verify_workers)
     pipe = None
     if args.policy:
         pipe = _build_pipeline(args)
@@ -873,6 +877,9 @@ def build_parser() -> argparse.ArgumentParser:
     cpump = cpsub.add_parser("pump", help="automatic continuation across batches/jobs")
     cpump.add_argument("--root", required=True)
     cpump.add_argument("--workers", type=int, default=4)
+    cpump.add_argument("--verify-workers", type=int, default=4,
+                      help="concurrent staging workers; also caps resident "
+                           "bytes — use 1 to keep exactly one shard on disk")
     cpump.add_argument("--min-free", type=int, default=None)
     cpump.add_argument("--policy", default=None)
     cpump.add_argument("--models-lock", default=None)
