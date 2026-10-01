@@ -53,6 +53,7 @@ HF/Xet cache; `ORNIX_ENV_FILE` points at a `.env` outside the repo.
 | 7 | HF staged publisher (approval-gated) | `publishing/` |
 | 8 | Cache, checkpoint, queue, retention | `ops/` |
 | — | Unified canonical output (6-field metadata, opaque filenames, speakers) | `canonical/` |
+| — | Multi-dataset campaign orchestration (bulk production) | `campaign/` |
 
 ## End-to-end run (local, offline)
 
@@ -194,6 +195,55 @@ Campaign batches export with `canonical export-batch --root … --job … --batc
 > when the strict six-field contract is required. See
 > [`docs/CANONICAL-NORMALIZATION.md`](docs/CANONICAL-NORMALIZATION.md).
 
+## Multi-dataset campaigns (bulk production)
+
+The `campaign/` subsystem curates **many** source datasets into one corpus.
+It exists because the single-run pipeline above does not scale to ~10
+datasets / ~24 GB: it adds revision pinning, resource-aware batch planning, a
+watermark + reservation ledger, bounded parallel download, and a `pump` loop
+that advances the queue unattended.
+
+`configs/ornix_campaign.manifest.yaml` drives it — layouts, columns and
+licenses there were **probed from the Hub**, not guessed. Rights are
+**operator-declared**, never inferred by the tool (a dataset with no Hub
+license is `UNSPECIFIED-OPERATOR-DECLARED` and conservatively `commercial:
+"false"`). `configs/ornix_campaign.small9.yaml` is the smaller first wave.
+
+```bash
+# 1. create the campaign: pin each dataset at a concrete commit SHA
+ornix-dataset campaign create --input configs/ornix_campaign.manifest.yaml \
+    --root work/campaign
+
+# 2. preview what would happen — read-only, mutates nothing
+ornix-dataset campaign report --root work/campaign --dry-run
+
+# 3. drive the whole queue: plan → download → QC → gate → release → publish
+#    → cleanup, for every batch of every job, within step/disk budgets
+ornix-dataset campaign pump --root work/campaign \
+    --policy configs/quality_policy.pilot.yaml --overlap --max-steps 4000
+```
+
+`--overlap` (G1) downloads the next batch on a background worker while QC runs
+on the current one; batches are disjoint (own staging/checkpoint/QC dirs) so
+the only shared mutable state is the locked reservation ledger.
+
+The individual steps are also runnable one at a time — `campaign inventory`,
+`plan`, `download`, `qc`, `gate`, `release`, `publish`, `cleanup`, `status`,
+`resume`, `preflight`, `report`. `campaign pump` is just the loop that chains
+them, and it is resumable: kill it at any point and re-run to continue.
+
+Cleanup is the one destructive step and it stays fail-closed: a batch's
+intermediates are deleted **only** with a `REMOTE_VERIFIED` receipt whose
+release dir still matches the verified digest *and* whose file inventory is
+unchanged *and* whose receipt used full-hash verification. Sample-only receipts
+can never authorize deletion. Evidence, audit logs, checkpoints, gate receipts,
+release dirs and the shared HF cache are never auto-deleted, and deletion is
+re-entrant — a crash mid-cleanup is finished by the next run.
+
+Publish is never automated past the operator gate: without `--approval` +
+`--repo` the pump records `awaiting-publish` and stops. See
+[`docs/MULTI-DATASET-AUTOMATION-PLAN.md`](docs/MULTI-DATASET-AUTOMATION-PLAN.md).
+
 ## Policies
 
 - `configs/quality_policy.example.yaml` — strict **public** target: music gate
@@ -223,6 +273,10 @@ PYTHONPATH=src:tests python -m pytest tests/unit  # unit only
 Suite maps to the spec test matrix T-001..T-016 (see the progress table in
 `docs/E2E-ORNIX-DATASET.md`). Tests are fully offline and CPU-only.
 
+Campaign behaviour is pinned separately in `tests/unit/test_cleanup.py`
+(G1 overlap, Gate-6 cleanup, pump state machine + step budget) and
+`tests/integration/test_campaign_e2e.py` (full download→publish→cleanup run).
+
 ## Fail-closed invariants (do not bypass)
 
 - Source bytes are immutable; every transform emits a new artifact referencing
@@ -233,4 +287,8 @@ Suite maps to the spec test matrix T-001..T-016 (see the progress table in
   speaker IDs.
 - Never upload `raw/`, `rejected/`, `review/`, `quarantine/`, tokens, or
   unclear-rights data. Gated HF access does not grant redistribution rights.
+- A campaign pins one commit SHA per dataset and never re-resolves it; every
+  listing and download in a run targets that same commit.
+- Campaign cleanup deletes only regenerable intermediates, and only against a
+  full-hash `REMOTE_VERIFIED` receipt whose release dir still matches.
 
