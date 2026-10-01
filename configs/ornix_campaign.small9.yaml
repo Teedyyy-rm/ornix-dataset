@@ -1,25 +1,36 @@
-# Ornix multi-dataset campaign manifest (driver: scripts/run_ornix_campaign.py).
+# Campaign manifest — 9 SMALL datasets (the "first wave").
 #
-# Full-scale curation of 9 Vietnamese speech datasets into ONE unified
-# canonical tree, then a gated publish to the destination repo.
-# (FPT FOSD is NOT here: use configs/ornix_campaign.small9.yaml, which includes
-# it. Its parquet embeds MP3, so it needs ORNIX_WAV_ONLY=0 — see that file.)
-# Layout/columns/licenses below were PROBED from the Hub (2026-09-27), not guessed.
+# Same rights/speaker declarations as configs/ornix_campaign.manifest.yaml,
+# except: VieNeu-TTS-140h is EXCLUDED here (24 GB, .arrow layout — the
+# extractor has no arrow path yet) and fpt_fosd is ADDED (0.82 GB).
 #
-# Rights are OPERATOR-DECLARED here, never inferred by the tool:
-#  - Datasets carrying a public license (MIT / CC-BY / CC-BY-SA / CC-BY-NC*) are
-#    declared REDISTRIBUTION_APPROVED with the commercial flag matching the license
-#    (NC => commercial "false").
+# Layout/columns/licenses were PROBED from the Hub on 2026-09-28, not guessed:
+#   repo                        layout          clips   data      Hub license
+#   toandev/ThanhPahm-TTS       parquet x2        4000   0.52 GB   CC-BY-NC-SA-4.0
+#   thangnzt/NgocHuyenViVoice   parquet x2        3776   0.79 GB   MIT
+#   pnnbao-ump/ngochuyen_voice  parquet x8        7540   3.27 GB   CC-BY-NC-4.0
+#   ntt123/VietBibleVox-aligned parquet x100     29126   9.46 GB   CC-BY-SA-4.0
+#   doof-ferb/fpt_fosd          parquet x2       25917   0.82 GB   CC-BY-4.0
+#   quocs/hatrang-voice-4h      loose x2406       2406   0.76 GB   (none)
+#   TuNguyen1101/luna_vi        loose x30420     30420   7.73 GB   (none)
+#   vuihocrnd/vi_voice_female   parquet x5       11489   2.17 GB   (none)
+#   thanghp456/W2WMovie-Voice-2 parquet x3        3970   0.97 GB   MIT
+#                                              total ~18 GB / ~118k clips
+#
+# Rights are OPERATOR-DECLARED, never inferred by the tool.
+#  - Public Hub license (MIT / CC-BY / CC-BY-SA / CC-BY-NC*) =>
+#    REDISTRIBUTION_APPROVED, commercial flag mirrors the license (NC => "false").
 #  - hatrang-voice-4h, luna_vi, vi_voice_female carry NO license on the Hub and
 #    are declared REDISTRIBUTION_APPROVED on the operator's explicit assertion
 #    of redistribution rights (hatrang: 2026-09-25; luna_vi + vi_voice_female:
-#    2026-09-27), conservatively marked commercial "false" and license
+#    2026-09-27), conservatively commercial "false", license
 #    "UNSPECIFIED-OPERATOR-DECLARED".
 #
-# speaker.mode:
-#   fixed  -> every clip of this source shares one speaker id (ref below)
-#   column -> per-row speaker taken from the dataset's `speaker` column
-#   none   -> no speaker ref (each clip becomes its own anonymous speaker)
+# fpt_fosd CAVEAT (measured, not assumed): its parquet embeds MP3 payloads
+# (original names are *.mp3). The extractor sniffs the real container from the
+# magic bytes, and the source-admission gate MEASURES the decoded codec and
+# marks source_lossy — it is not trusted from the extension. Set
+# ORNIX_WAV_ONLY=0 so MP3 sources are not dropped before measurement.
 
 destination:
   repo_id: Teedyyy-rm/Ornix-Datasets
@@ -28,7 +39,7 @@ destination:
 defaults:
   language: vi
   audio_col: audio
-  min_free_gib: 25          # stop-safe: pause a dataset if free disk drops below this
+  min_free_gib: 25
 
 datasets:
   - name: thanhpahm_tts
@@ -58,16 +69,24 @@ datasets:
   - name: vietbiblevox
     repo: ntt123/VietBibleVox-aligned
     format: parquet
-    parquet_prefix: ""        # shards are part_000.parquet at repo root
+    parquet_prefix: ""
     text_col: text
     speaker: {mode: fixed, ref: thanh_nam}
     rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "true", license: CC-BY-SA-4.0, note: "VietBibleVox-aligned CC-BY-SA-4.0; share-alike"}
+
+  - name: fpt_fosd
+    repo: doof-ferb/fpt_fosd
+    format: parquet
+    parquet_prefix: ""
+    text_col: transcription
+    speaker: {mode: none}
+    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "true", license: CC-BY-4.0, note: "fpt_fosd CC-BY-4.0; parquet embeds MP3 - codec measured at admission"}
 
   - name: hatrang_voice
     repo: quocs/hatrang-voice-4h
     format: loose
     loose_audio_prefix: raw_audio/
-    loose_meta: raw_audio/metadata.jsonl        # {file_name, transcription}
+    loose_meta: raw_audio/metadata.jsonl
     loose_meta_kind: jsonl
     text_col: transcription
     file_col: file_name
@@ -78,7 +97,7 @@ datasets:
     repo: TuNguyen1101/luna_vi
     format: loose
     loose_audio_prefix: data/
-    loose_meta: metadata.csv                    # header: file_name,text,language,index
+    loose_meta: metadata.csv
     loose_meta_kind: csv
     text_col: text
     file_col: file_name
@@ -89,7 +108,7 @@ datasets:
     repo: vuihocrnd/vi_voice_female
     format: parquet
     parquet_prefix: data
-    text_col: text_norm                         # normalized (digits expanded); raw `text` kept out
+    text_col: text_norm
     speaker: {mode: fixed, ref: hong_hanh}
     rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: UNSPECIFIED-OPERATOR-DECLARED, note: "no Hub license; operator asserts redistribution rights 2026-09-27"}
 
@@ -100,10 +119,3 @@ datasets:
     text_col: text
     speaker: {mode: fixed, ref: hong_ngan}
     rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "true", license: MIT, note: "W2WMovie-Voice-2 MIT"}
-
-  - name: vieneu_tts_140h
-    repo: pnnbao-ump/VieNeu-TTS-140h
-    format: arrow                               # data-*.arrow at repo root
-    text_col: text
-    speaker: {mode: column, col: speaker}       # per-row ids (jellyfish1010_0052, ...)
-    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: CC-BY-NC-4.0, note: "VieNeu-TTS-140h CC-BY-NC-4.0; NC"}
