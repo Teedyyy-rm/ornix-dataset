@@ -24,8 +24,10 @@ from __future__ import annotations
 
 import os
 import shutil
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+import threading
+from dataclasses import dataclass, field
+from shutil import disk_usage
+from typing import Any, Callable, Dict, List, NamedTuple, Optional
 
 from ..publishing.approval import release_digest
 from ..util.timeutil import utc_now_iso
@@ -33,6 +35,7 @@ from .downloading import batch_staging_dir
 from .models import BatchStatus
 from .processing import qc_paths
 from .publishing import load_receipt, release_file_inventory, receipt_path_for
+from .resources import try_admit
 
 ELIGIBLE_STATUSES = (BatchStatus.RELEASE_READY.value, BatchStatus.DONE.value)
 
@@ -184,6 +187,230 @@ def _siblings_processed(store: Any, job: Any, exclude: str = "") -> bool:
     return True
 
 
+class _Outcome(NamedTuple):
+    """Effect of one batch action on the pump's two loops.
+
+    ``progressed`` re-enters the job's outer while-loop (real work happened).
+    ``break_scan`` ends the batch pass early in overlap mode so the next pass
+    can pair QC-current with download-next (G1).
+    """
+
+    progressed: bool
+    break_scan: bool
+
+
+_NOTHING = _Outcome(False, False)     # no work; may still have logged a status
+_BREAK = _Outcome(True, True)        # download / qc / gate / publish / cleanup
+_KEEP_SCAN = _Outcome(True, False)   # prepare: real work, but keep scanning
+
+
+@dataclass
+class _Pump:
+    """Mutable state of one ``pump_campaign`` run.
+
+    Holding the callbacks, the step budget and the step log here lets every
+    phase be a small method instead of one branch inside a long state machine.
+    """
+
+    store: Any
+    ledger: Any
+    gate: Any
+    download_one: Callable[..., Dict[str, Any]]
+    qc_one: Callable[[str, str], Dict[str, Any]]
+    gate_one: Callable[[str, str], Dict[str, Any]]
+    prepare_one: Optional[Callable[[str, str], Dict[str, Any]]] = None
+    publish_one: Optional[Callable[[str], Dict[str, Any]]] = None
+    cleanup_one: Optional[Callable[[str, str], Dict[str, Any]]] = None
+    max_steps: int = 100
+    min_free_bytes: int = 0
+    log: List[Dict[str, Any]] = field(default_factory=list)
+    steps: int = 0
+    stopped: bool = False   # step budget exhausted
+
+    # -- budget + log --------------------------------------------------------
+
+    def record(self, action: str, job_id: str, batch_id: str = "",
+               detail: Optional[Dict[str, Any]] = None) -> None:
+        """Append a step and latch ``stopped`` once the budget is gone.
+
+        ``stopped`` is a latch rather than an exception so the caller still runs
+        its end-of-pass bookkeeping (job completion) before unwinding — a run
+        that dies exactly on its last step never loses a DONE marker.
+        """
+        self.steps += 1
+        self.log.append({"step": self.steps, "action": action,
+                         "job": job_id, "batch": batch_id, **(detail or {})})
+        if self.steps >= self.max_steps:
+            self.stopped = True
+
+    def free_bytes(self) -> int:
+        return disk_usage(self.store.root).free
+
+    def may_run(self) -> bool:
+        return self.gate.evaluate(self.free_bytes()) == "run"
+
+    # -- job level -----------------------------------------------------------
+
+    def mark_job_done(self, job_id: str) -> None:
+        """Mark a job DONE once every batch is DONE. Idempotent."""
+        job = self.store.load_job(job_id)
+        if job.status == BatchStatus.DONE.value or not job.batch_ids:
+            return
+        if all(self.store.load_batch(b).status == BatchStatus.DONE.value
+               for b in job.batch_ids):
+            job.status = BatchStatus.DONE.value
+            self.store.save_job(job)
+            self.log.append({"step": self.steps + 1, "action": "job-done",
+                             "job": job_id, "batch": ""})
+
+    def run_job(self, job_id: str, overlap: bool) -> None:
+        """Drive one job's queue until it is DONE, stuck, or out of budget."""
+        if self.store.load_job(job_id).status == BatchStatus.DONE.value:
+            return
+        while not self.stopped:
+            progressed = False
+            job = self.store.load_job(job_id)
+            if overlap and not self.stopped and self._overlap_step(job):
+                progressed = True
+                self.mark_job_done(job_id)
+                continue
+            for bid in list(job.batch_ids):
+                if self.stopped:
+                    break
+                outcome = self.advance(job, self.store.load_batch(bid))
+                progressed = progressed or outcome.progressed
+                if overlap and outcome.break_scan:
+                    break
+            self.mark_job_done(job_id)
+            if not progressed:
+                break
+
+    # -- batch level ---------------------------------------------------------
+
+    def advance(self, job: Any, batch: Any) -> _Outcome:
+        """Advance one batch by at most one action."""
+        st = batch.status
+        if st == BatchStatus.PLANNED.value:
+            return self._download_planned(batch)
+        if st == BatchStatus.IN_PROGRESS.value:
+            return self._resume_in_progress(batch)
+        if st == BatchStatus.BATCH_PROCESSED.value:
+            return self._gate_batch(job, batch)
+        if st == BatchStatus.RELEASE_READY.value:
+            return self._finish_release(batch)
+        return _NOTHING  # DONE batches need nothing
+
+    def _download_planned(self, batch: Any) -> _Outcome:
+        if not self.may_run():
+            self.record("stopped-disk", batch.job_id, batch.batch_id)
+            return _NOTHING
+        rep = self.download_one(batch.job_id, batch.batch_id)
+        self.record("download", batch.job_id, batch.batch_id,
+                    {"ok": rep.get("ok")})
+        return _BREAK
+
+    def _resume_in_progress(self, batch: Any) -> _Outcome:
+        """Finish an interrupted download, or QC a complete one."""
+        complete = bool(
+            (batch.result or {}).get("download", {}).get("complete"))
+        rep = self.qc_one(batch.job_id, batch.batch_id) if complete \
+            else self.download_one(batch.job_id, batch.batch_id)
+        self.record("qc" if complete else "download",
+                    batch.job_id, batch.batch_id, {"ok": rep.get("ok")})
+        return _BREAK
+
+    def _gate_batch(self, job: Any, batch: Any) -> _Outcome:
+        # The gate is job-global: it refuses until EVERY sibling batch is
+        # processed. Attempting it early would burn the step budget on a
+        # guaranteed failure and starve the QC of later batches (they never
+        # get their turn), so defer instead of retrying.
+        if not _siblings_processed(self.store, job, batch.batch_id):
+            return _NOTHING
+        rep = self.gate_one(batch.job_id, batch.batch_id)
+        self.record("gate", batch.job_id, batch.batch_id,
+                    {"ok": rep.get("ok")})
+        return _BREAK
+
+    def _finish_release(self, batch: Any) -> _Outcome:
+        """RELEASE_READY: prepare, publish, then clean up once verified."""
+        job_id, bid = batch.job_id, batch.batch_id
+        rid = ((batch.result or {}).get("release") or {}).get("release_id", "")
+        if not rid:
+            return self._prepare_or_wait(job_id, bid)
+        if os.path.exists(receipt_path_for(self.store, rid)):
+            if self.cleanup_one is None:
+                return _NOTHING
+            rep = self.cleanup_one(job_id, bid)
+            self.record("cleanup", job_id, bid, {"ok": rep.get("ok")})
+            return _BREAK
+        if self.publish_one is None:
+            self.record("awaiting-publish", job_id, bid)
+            return _NOTHING
+        rep = self.publish_one(rid)
+        self.record("publish", job_id, bid, {"ok": rep.get("ok")})
+        return _BREAK
+
+    def _prepare_or_wait(self, job_id: str, bid: str) -> _Outcome:
+        """Build the missing release, or wait for an operator to do it."""
+        if self.prepare_one is None:
+            self.record("awaiting-release", job_id, bid)
+            return _NOTHING
+        rep = self.prepare_one(job_id, bid)
+        self.record("prepare", job_id, bid, {"ok": rep.get("ok")})
+        return _KEEP_SCAN
+
+    # -- overlap -------------------------------------------------------------
+
+    def _overlap_step(self, job: Any) -> bool:
+        """One overlapped pair: QC the current batch while downloading the next.
+
+        Returns True when a pair ran (the caller re-loops). Admission happens
+        here in the main thread; the worker only executes the admitted download.
+        """
+        qc_bid, dl_bid = None, None
+        for bid in job.batch_ids:
+            b = self.store.load_batch(bid)
+            if qc_bid is None and b.status == BatchStatus.IN_PROGRESS.value \
+                    and (b.result or {}).get("download", {}).get("complete"):
+                qc_bid = bid
+            elif dl_bid is None and b.status == BatchStatus.PLANNED.value:
+                dl_bid = bid
+            if qc_bid and dl_bid:
+                break
+        if not qc_bid or not dl_bid:
+            return False
+        free = self.free_bytes()
+        if self.gate.evaluate(free) != "run":
+            return False
+        if not try_admit(self.store.load_batch(dl_bid), self.ledger,
+                         free, self.min_free_bytes):
+            return False  # reservation unavailable: sequential path handles it
+
+        worker_rep: Dict[str, Any] = {}
+
+        def _worker() -> None:
+            try:
+                worker_rep.update(self.download_one(job.job_id, dl_bid, True))
+            except Exception as e:  # never let a worker thread die silently
+                worker_rep.update({"ok": False, "admitted": True,
+                                   "reason": f"worker-error: {e}"})
+
+        t = threading.Thread(target=_worker, name=f"pump-dl-{dl_bid}",
+                             daemon=True)
+        t.start()
+        try:
+            qc_rep = self.qc_one(job.job_id, qc_bid)
+        finally:
+            t.join(timeout=3600)
+        if t.is_alive():
+            return False  # worker hung: leave states as-is, sequential retry later
+        self.record("download", job.job_id, dl_bid,
+                    {"ok": worker_rep.get("ok"), "overlapped": True})
+        self.record("qc", job.job_id, qc_bid,
+                    {"ok": qc_rep.get("ok"), "overlapped": True})
+        return True
+
+
 def pump_campaign(store: Any, ledger: Any, gate: Any,
                   download_one: Callable[..., Dict[str, Any]],
                   qc_one: Callable[[str, str], Dict[str, Any]],
@@ -207,183 +434,15 @@ def pump_campaign(store: Any, ledger: Any, gate: Any,
     Batches are disjoint (own staging/checkpoint/QC dirs), so the two threads
     never share mutable state except the locked ledger.
     """
-    from shutil import disk_usage
-
     campaign = store.load_campaign()
-    log: List[Dict[str, Any]] = []
-    steps = 0
-
-    def _step(action: str, job_id: str, batch_id: str = "",
-              detail: Optional[Dict[str, Any]] = None) -> bool:
-        nonlocal steps
-        steps += 1
-        log.append({"step": steps, "action": action, "job": job_id,
-                    "batch": batch_id, **(detail or {})})
-        return steps < max_steps
-
+    pump = _Pump(store=store, ledger=ledger, gate=gate,
+                 download_one=download_one, qc_one=qc_one, gate_one=gate_one,
+                 prepare_one=prepare_one, publish_one=publish_one,
+                 cleanup_one=cleanup_one, max_steps=max_steps,
+                 min_free_bytes=min_free_bytes)
     for job_id in list(campaign.job_ids):
-        job = store.load_job(job_id)
-        if job.status == BatchStatus.DONE.value or job.status == "DONE":
-            continue
-        progressed = True
-        while progressed and steps < max_steps:
-            progressed = False
-            job = store.load_job(job_id)
-            if overlap and steps < max_steps and _overlap_step(
-                    store, ledger, gate, job, download_one, qc_one,
-                    min_free_bytes, _step):
-                progressed = True
-                job = store.load_job(job_id)
-                states = [store.load_batch(x).status for x in job.batch_ids]
-                if job.batch_ids and all(
-                        s == BatchStatus.DONE.value for s in states) \
-                        and job.status != "DONE":
-                    job.status = "DONE"
-                    store.save_job(job)
-                    log.append({"step": steps + 1, "action": "job-done",
-                                "job": job_id, "batch": ""})
-                continue
-            for bid in list(job.batch_ids):
-                if steps >= max_steps:
-                    break
-                mark = len(log)
-                b = store.load_batch(bid)
-                st = b.status
-                if st == BatchStatus.PLANNED.value:
-                    if gate.evaluate(disk_usage(store.root).free) != "run":
-                        if not _step("stopped-disk", job_id, bid):
-                            return _report(campaign, log, steps)
-                        continue
-                    rep = download_one(job_id, bid)
-                    progressed = True
-                    if not _step("download", job_id, bid, {"ok": rep.get("ok")}):
-                        return _report(campaign, log, steps)
-                elif st == BatchStatus.IN_PROGRESS.value:
-                    dl = (b.result or {}).get("download", {})
-                    if not dl.get("complete"):
-                        rep = download_one(job_id, bid)
-                    else:
-                        rep = qc_one(job_id, bid)
-                    progressed = True
-                    if not _step("qc" if dl.get("complete") else "download",
-                                 job_id, bid, {"ok": rep.get("ok")}):
-                        return _report(campaign, log, steps)
-                elif st == BatchStatus.BATCH_PROCESSED.value:
-                    # The gate is job-global: it refuses until EVERY sibling
-                    # batch is processed. Attempting it early would burn the
-                    # step budget on a guaranteed failure and starve the QC
-                    # of later batches (they never get their turn), so defer.
-                    if not _siblings_processed(store, job, bid):
-                        continue
-                    rep = gate_one(job_id, bid)
-                    progressed = True
-                    if not _step("gate", job_id, bid, {"ok": rep.get("ok")}):
-                        return _report(campaign, log, steps)
-                elif st == BatchStatus.RELEASE_READY.value:
-                    rel = (b.result or {}).get("release", {})
-                    rid = rel.get("release_id", "")
-                    if not rid:
-                        if prepare_one is None:
-                            if not _step("awaiting-release", job_id, bid):
-                                return _report(campaign, log, steps)
-                            continue
-                        rep = prepare_one(job_id, bid)
-                        progressed = True
-                        if not _step("prepare", job_id, bid,
-                                     {"ok": rep.get("ok")}):
-                            return _report(campaign, log, steps)
-                        continue
-                    receipt_file = os.path.join(
-                        store.root, "releases", f"{rid}.REMOTE_VERIFIED.json")
-                    if os.path.exists(receipt_file):
-                        if cleanup_one is not None:
-                            rep = cleanup_one(job_id, bid)
-                            progressed = True
-                            if not _step("cleanup", job_id, bid,
-                                         {"ok": rep.get("ok")}):
-                                return _report(campaign, log, steps)
-                    elif publish_one is not None:
-                        rep = publish_one(rid)
-                        progressed = True
-                        if not _step("publish", job_id, bid,
-                                     {"ok": rep.get("ok")}):
-                            return _report(campaign, log, steps)
-                    else:
-                        if not _step("awaiting-publish", job_id, bid):
-                            return _report(campaign, log, steps)
-                # DONE batches need nothing
-                # Overlap mode acts on one batch per pass so the next pass can
-                # pair QC-current with download-next (G1); sequential mode
-                # keeps the old drain-everything behavior.
-                if overlap and len(log) != mark:
-                    break
-            job = store.load_job(job_id)
-            states = [store.load_batch(x).status for x in job.batch_ids]
-            if job.batch_ids and all(s == BatchStatus.DONE.value for s in states) \
-                    and job.status != "DONE":
-                job.status = "DONE"
-                store.save_job(job)
-                log.append({"step": steps + 1, "action": "job-done",
-                            "job": job_id, "batch": ""})
-    return _report(campaign, log, steps)
-
-
-def _overlap_step(store: Any, ledger: Any, gate: Any, job: Any,
-                  download_one: Callable[..., Dict[str, Any]],
-                  qc_one: Callable[[str, str], Dict[str, Any]],
-                  min_free_bytes: int, _step: Callable[..., bool]) -> bool:
-    """One overlapped pair: QC current batch while downloading the next.
-
-    Returns True when a pair ran (caller re-loops). Admission happens here in
-    the main thread; the worker only executes the admitted download.
-    """
-    from shutil import disk_usage
-
-    from .resources import try_admit
-
-    qc_bid, dl_bid = None, None
-    for bid in job.batch_ids:
-        b = store.load_batch(bid)
-        if qc_bid is None and b.status == BatchStatus.IN_PROGRESS.value \
-                and (b.result or {}).get("download", {}).get("complete"):
-            qc_bid = bid
-        elif dl_bid is None and b.status == BatchStatus.PLANNED.value:
-            dl_bid = bid
-        if qc_bid and dl_bid:
-            break
-    if not qc_bid or not dl_bid:
-        return False
-    if gate.evaluate(disk_usage(store.root).free) != "run":
-        return False
-    dl_batch = store.load_batch(dl_bid)
-    if not try_admit(dl_batch, ledger,
-                     disk_usage(store.root).free, min_free_bytes):
-        return False  # reservation unavailable: sequential path handles it
-
-    import threading as _th
-    worker_rep: Dict[str, Any] = {}
-
-    def _worker() -> None:
-        try:
-            worker_rep.update(download_one(job.job_id, dl_bid, True))
-        except Exception as e:  # never let a worker thread die silently
-            worker_rep.update({"ok": False, "admitted": True,
-                               "reason": f"worker-error: {e}"})
-
-    t = _th.Thread(target=_worker, name=f"pump-dl-{dl_bid}", daemon=True)
-    t.start()
-    try:
-        qc_rep = qc_one(job.job_id, qc_bid)
-    finally:
-        t.join(timeout=3600)
-    if t.is_alive():
-        return False  # worker hung: leave states as-is, sequential retry later
-    _step("download", job.job_id, dl_bid, {"ok": worker_rep.get("ok"),
-                                           "overlapped": True})
-    _step("qc", job.job_id, qc_bid, {"ok": qc_rep.get("ok"),
-                                     "overlapped": True})
-    return True
-
-
-def _report(campaign: Any, log: List[Dict[str, Any]], steps: int) -> Dict[str, Any]:
-    return {"campaign_id": campaign.campaign_id, "steps": steps, "log": log}
+        pump.run_job(job_id, overlap)
+        if pump.stopped:
+            break  # budget is global: remaining jobs would be no-ops anyway
+    return {"campaign_id": campaign.campaign_id, "steps": pump.steps,
+            "log": pump.log}

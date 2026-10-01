@@ -12,7 +12,6 @@ from ornix_dataset.campaign import (
     WatermarkGate,
     batch_staging_dir,
     cleanup_batch,
-    eligibility,
     gate_batch_release,
     manifest_archive_path,
     prepare_release,
@@ -364,8 +363,6 @@ def test_cli_cleanup_pump_fail_closed(tmp_path, capsys):
 # -- G1: overlapped pump ----------------------------------------------------------
 
 def _overlap_world(tmp_path, tag):
-    import time as _t
-
     net = FakeNet(tmp_path / tag)
     net.delay = 0.4
     for n in ("a.wav", "b.wav"):
@@ -444,3 +441,161 @@ def test_overlap_yields_to_watermark(tmp_path):
     assert any(e["action"] == "stopped-disk" for e in rep["log"])
     assert net.calls == []
     assert store.load_batch(batches[0].batch_id).status == "PLANNED"
+
+
+# -- pump state machine: operator-gated branches + budget -------------------------
+#
+# These drive _Pump directly with an in-memory store: they pin the *dispatch*
+# rules (which callback fires for which batch status), not the download/QC
+# mechanics — those are covered by the FakeHub world above.
+
+class _FakeBatch:
+    def __init__(self, bid, job_id, status, result=None):
+        self.batch_id = bid
+        self.job_id = job_id
+        self.status = status
+        self.result = result or {}
+
+
+class _FakeJob:
+    def __init__(self, job_id, batch_ids, status="ACTIVE"):
+        self.job_id = job_id
+        self.batch_ids = batch_ids
+        self.status = status
+
+
+class _FakeStore:
+    """Minimal store surface for _Pump: jobs/batches only, all in memory."""
+
+    def __init__(self, jobs, batches, tmp_path):
+        self.root = str(tmp_path)
+        self._jobs = jobs
+        self._batches = batches
+        self.saved = []
+
+    def load_campaign(self):
+        return type("C", (), {"campaign_id": "c1",
+                              "job_ids": list(self._jobs)})()
+
+    def load_job(self, job_id):
+        return self._jobs[job_id]
+
+    def save_job(self, job):
+        self.saved.append(("job", job.job_id, job.status))
+
+    def load_batch(self, bid):
+        return self._batches[bid]
+
+
+def _pump_world(tmp_path, batches, download_mutates=None, **kwargs):
+    """Build a one-job store plus the callbacks the pump needs.
+
+    Callbacks receive ``(job_id, batch_id)`` exactly like the real ones;
+    ``download_mutates`` lets a test advance the batch status from inside the
+    download callback, the way a real download would.
+    """
+    job = _FakeJob("j1", [b.batch_id for b in batches])
+    store = _FakeStore({"j1": job}, {b.batch_id: b for b in batches}, tmp_path)
+    calls = []
+
+    def _mk(name, mutate=None):
+        def _fn(job_id, batch_id, *rest):
+            calls.append(name)
+            if mutate is not None:
+                mutate(store.load_batch(batch_id))
+            return {"ok": True}
+        return _fn
+
+    gate = type("G", (), {"evaluate": staticmethod(lambda free: "run")})()
+    from ornix_dataset.campaign.cleanup import _Pump
+    kwargs.setdefault("gate_one", _mk("gate"))
+    pump = _Pump(store=store, ledger=None, gate=gate,
+                 download_one=kwargs.pop("download_one",
+                                         _mk("download", download_mutates)),
+                 qc_one=kwargs.pop("qc_one", _mk("qc")),
+                 **kwargs)
+    return pump, calls
+
+
+def test_pump_records_awaiting_publish_when_no_callback(tmp_path):
+    """No publisher configured: never self-approve, just record and stop."""
+    batch = _FakeBatch("b1", "j1", "RELEASE_READY",
+                       {"release": {"release_id": "R1"}})
+    pump, calls = _pump_world(tmp_path, [batch])
+    pump.run_job("j1", overlap=False)
+    assert calls == []  # no download/qc/gate/publish callback may fire
+    assert [e["action"] for e in pump.log] == ["awaiting-publish"]
+    # the batch must stay RELEASE_READY: the pump never invents progress
+    assert batch.status == "RELEASE_READY"
+
+
+def test_pump_records_awaiting_release_without_prepare(tmp_path):
+    """RELEASE_READY with no release id and no prepare callback => wait."""
+    batch = _FakeBatch("b1", "j1", "RELEASE_READY")
+    pump, calls = _pump_world(tmp_path, [batch])
+    pump.run_job("j1", overlap=False)
+    assert calls == []
+    assert [e["action"] for e in pump.log] == ["awaiting-release"]
+
+
+def test_pump_prepare_builds_missing_release(tmp_path):
+    """With a prepare callback, the missing release is built, then it waits for
+    an operator to publish it — prepare runs exactly once, never in a loop."""
+    batch = _FakeBatch("b1", "j1", "RELEASE_READY")
+    prepared = []
+
+    def _prepare(job_id, batch_id):
+        prepared.append(batch_id)
+        batch.result = {"release": {"release_id": "R1"}}  # what prepare does
+        return {"ok": True}
+
+    pump, calls = _pump_world(tmp_path, [batch], prepare_one=_prepare)
+    pump.run_job("j1", overlap=False)
+    assert prepared == ["b1"]  # built once, not re-run every pass
+    assert calls == []         # ...and no download/qc/gate side effects
+    assert [e["action"] for e in pump.log] == ["prepare", "awaiting-publish"]
+
+
+def test_pump_skips_cleanup_without_callback(tmp_path):
+    """Verified receipt but no cleanup callback: no delete, no error."""
+    rid = "R1"
+    os.makedirs(os.path.join(str(tmp_path), "releases"), exist_ok=True)
+    open(os.path.join(str(tmp_path), "releases",
+                      f"{rid}.REMOTE_VERIFIED.json"), "w").close()
+    batch = _FakeBatch("b1", "j1", "RELEASE_READY",
+                       {"release": {"release_id": rid}})
+    pump, calls = _pump_world(tmp_path, [batch])
+    pump.run_job("j1", overlap=False)
+    assert calls == []
+    assert pump.log == []  # nothing to do, nothing recorded
+
+
+def test_pump_budget_exhaustion_still_marks_job_done(tmp_path):
+    """Regression: a run that dies exactly on its last step must not lose the
+    DONE marker — the budget is a latch, so end-of-pass bookkeeping still runs."""
+    batches = [_FakeBatch("b1", "j1", "PLANNED"),
+               _FakeBatch("b2", "j1", "PLANNED")]
+    pump, _ = _pump_world(
+        tmp_path, batches, max_steps=2,
+        download_mutates=lambda b: setattr(b, "status", "DONE"))
+    pump.run_job("j1", overlap=False)
+    assert pump.stopped and pump.steps == 2
+    # both batches DONE => the job must be marked DONE despite the budget
+    assert ("job", "j1", "DONE") in pump.store.saved
+    assert pump.log[-1]["action"] == "job-done"
+
+
+def test_pump_skips_already_done_job(tmp_path):
+    job = _FakeJob("j1", ["b1"], status="DONE")
+    batch = _FakeBatch("b1", "j1", "DONE")
+    store = _FakeStore({"j1": job}, {"b1": batch}, tmp_path)
+    from ornix_dataset.campaign.cleanup import _Pump
+    called = []
+    pump = _Pump(store=store, ledger=None,
+                 gate=type("G", (), {"evaluate": staticmethod(
+                     lambda f: "run")})(),
+                 download_one=lambda *a: called.append("d"),
+                 qc_one=lambda *a: called.append("q"),
+                 gate_one=lambda *a: called.append("g"))
+    pump.run_job("j1", overlap=False)
+    assert called == [] and pump.log == [] and pump.steps == 0
