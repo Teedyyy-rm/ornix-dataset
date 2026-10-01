@@ -29,7 +29,6 @@ import queue
 import random
 import shutil
 import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -431,6 +430,37 @@ class _AdaptiveGate:
 # journal states (Checkpoint: only DONE counts as complete on replay)
 _STAGED_DONE = "DONE"
 
+#: Stage faults that already say what went wrong. Anything else is reported as
+#: an incomplete batch, so a partial failure is never mistaken for success.
+_TYPED_FAULTS = (PermanentDownloadError, DiskFullError, RamGuardError,
+                 FailedVerificationError, EmptyInventoryError)
+
+
+def _peak_rss_mb() -> float:
+    """Process peak RSS in MB (ru_maxrss is KiB on Linux, bytes on macOS)."""
+    try:
+        import resource
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return round(rss / 1024.0 if sys.platform != "darwin" else rss / 1e6, 2)
+    except Exception:
+        return 0.0
+
+
+@dataclass
+class _RunContext:
+    """Per-run state shared by the pipeline stages.
+
+    Deliberately NOT stored on the downloader: one instance may run several
+    batches back to back, so callbacks and the ordered map must belong to the
+    run that supplied them.
+    """
+
+    staged_name: Callable[[InventoryItem], str]
+    on_staged: Optional[Callable[[DownloadResult], None]]
+    on_ready: Optional[Callable[[DownloadResult], None]]
+    ordered: Dict[int, DownloadResult] = field(default_factory=dict)
+    drainer_exc: List[BaseException] = field(default_factory=list)
+
 
 class HfBatchDownloader:
     """Bounded concurrent batch downloader over official HF transport."""
@@ -697,124 +727,56 @@ class HfBatchDownloader:
         self._check_ram_guard()
         self._check_disk(sum(i.size for i in items))
         self._clean_partials()
-        staged_name = staged_name or (lambda it: os.path.basename(it.path_in_repo))
-        skip_staged = skip_staged or {}
+        ctx = _RunContext(
+            staged_name=staged_name or
+            (lambda it: os.path.basename(it.path_in_repo)),
+            on_staged=on_staged, on_ready=on_ready)
         t_start = time.monotonic()
-        ordered: Dict[int, DownloadResult] = {}
-        failures: List[str] = []
+        try:
+            self._run_pipeline(items, skip_staged or {}, ctx)
+        finally:
+            self._finalize_metrics(items, t_start)
+        return self._resolve_outcome(items, ctx)
 
-        # fast path: everything already staged+verified (T6 rerun without work)
-        reused_map: Dict[int, DownloadResult] = {}
+    # -- stage 1: produce -----------------------------------------------------
+
+    def _seed_reused(self, items: List[InventoryItem],
+                     skip_staged: Dict[str, str], ctx: "_RunContext"
+                     ) -> List[InventoryItem]:
+        """Fast path (T6): reuse already staged+verified files without fetching.
+
+        Returns the items that still need a download.
+        """
         pending: List[InventoryItem] = []
         for it in items:
             hit = self._already_staged(it, skip_staged)
             if hit is None:
                 pending.append(it)
             else:
-                reused_map[it.index] = hit
-        ordered.update(reused_map)
+                ctx.ordered[it.index] = hit
+        return pending
 
-        def net_job(item: InventoryItem) -> None:
-            if self._abort is not None:
-                return
-            self._gate.acquire()
-            with self._active_lock:
-                self._active += 1
-                self._peak_active = max(self._peak_active, self._active)
-            try:
-                if self.journal is not None:
-                    self.journal.mark(item.key, "DOWNLOADING")
-                cache_path, from_cache, t_dl = self._download_with_retry(item)
-                if self.journal is not None:
-                    self.journal.mark(item.key, "DOWNLOADED")
-                with self._metrics_lock:
-                    self.metrics.n_downloaded += 1
-                    if not from_cache:
-                        self.metrics.network_bytes += \
-                            os.path.getsize(cache_path) if os.path.exists(cache_path) else 0
-                    self.metrics.t_download_s += t_dl
-                with self._io_lock:
-                    self._io_submitted += 1
-                io_pool.submit(io_job, item, cache_path, from_cache, t_dl)
-            except BaseException as exc:  # noqa: BLE001 - must not kill the pool
-                self._set_abort(exc)
-            finally:
-                with self._active_lock:
-                    self._active -= 1
-                self._gate.release(ok=self._abort is None)
-
-        def io_job(item: InventoryItem, cache_path: str, from_cache: bool,
-                   t_dl: float) -> None:
-            try:
-                res = self._verify_and_stage(item, cache_path, from_cache, t_dl,
-                                             staged_name)
-                with self._metrics_lock:
-                    self.metrics.t_verify_stage_s += res.t_verify_stage_s
-                if on_staged is not None:
-                    # Earliest safe point: bytes are staged and verified, but
-                    # not yet queued. Bounding work belongs HERE so a staged
-                    # file never sits idle occupying disk.
-                    on_staged(res)
-                self._ready.put(res)  # blocks when full: backpressure (T4)
-            except BaseException as exc:  # noqa: BLE001
-                self._set_abort(exc)
-            finally:
-                self._budget.release(item.size)
-                with self._io_lock:
-                    self._io_done += 1
-
+    def _run_pipeline(self, items: List[InventoryItem],
+                      skip_staged: Dict[str, str], ctx: "_RunContext") -> None:
+        """Run the net -> io -> drainer stages and join every one of them."""
+        pending = self._seed_reused(items, skip_staged, ctx)
         # per-run stage counters (an instance may run several batches; the
         # abort flag stays sticky fail-closed across runs)
         with self._io_lock:
             self._io_open = True
             self._io_submitted = 0
             self._io_done = 0
-        drainer_exc: List[BaseException] = []
-
-        def _drain() -> None:
-            try:
-                deadline = time.monotonic() + 3600
-                while time.monotonic() < deadline:
-                    with self._io_lock:
-                        io_finished = (not self._io_open
-                                       and self._io_done >= self._io_submitted)
-                    if io_finished and self._ready.empty():
-                        break
-                    try:
-                        res = self._ready.get(timeout=0.2)
-                    except queue.Empty:
-                        continue
-                    if self._abort is None:
-                        ordered[res.index] = res
-                        with self._metrics_lock:
-                            self.metrics.peak_ready_depth = max(
-                                self.metrics.peak_ready_depth, self._ready.qsize())
-                        if on_ready is not None:
-                            # Serial per-file handoff, coupled to consumption:
-                            # a slow observer throttles the drain, the bounded
-                            # queue throttles io, the byte budget throttles the
-                            # producer — bounded memory end to end (T4).
-                            on_ready(res)
-            except BaseException as exc:  # noqa: BLE001 - surface in caller
-                self._set_abort(exc)
-                drainer_exc.append(exc)
-
         try:
             io_pool = ThreadPoolExecutor(max_workers=self.cfg.verify_workers,
                                          thread_name_prefix="ornix-io")
-            net_pool = ThreadPoolExecutor(max_workers=min(self.cfg.file_workers,
-                                                          HARD_MAX_FILE_WORKERS),
-                                          thread_name_prefix="ornix-net")
-            drainer = threading.Thread(target=_drain, name="ornix-drain",
-                                       daemon=True)
+            net_pool = ThreadPoolExecutor(
+                max_workers=min(self.cfg.file_workers, HARD_MAX_FILE_WORKERS),
+                thread_name_prefix="ornix-net")
+            drainer = threading.Thread(target=self._drain, args=(ctx,),
+                                       name="ornix-drain", daemon=True)
             drainer.start()
             try:
-                for item in pending:
-                    if self._abort is not None:
-                        break
-                    self._check_disk(item.size)
-                    self._budget.acquire(item.size)  # never submit-all (T3)
-                    net_pool.submit(net_job, item)
+                self._produce(net_pool, io_pool, pending, ctx)
             finally:
                 # net stage closed: no more io submissions after this point
                 net_pool.shutdown(wait=True)
@@ -825,38 +787,150 @@ class HfBatchDownloader:
         except KeyboardInterrupt:
             self._set_abort(KeyboardInterrupt())
             raise
-        finally:
-            with self._metrics_lock:
-                self.metrics.peak_active_downloads = self._peak_active
-                self.metrics.breaker_trips = self._gate.trips
-                self.metrics.n_items = len(items)
-                self.metrics.wall_s = time.monotonic() - t_start
-                try:
-                    import resource
-                    # ru_maxrss is KiB on Linux, bytes on macOS
-                    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                    self.metrics.peak_rss_mb = round(
-                        rss / 1024.0 if sys.platform != "darwin" else rss / 1e6, 2)
-                except Exception:
-                    pass
 
-        if drainer_exc:
+    def _produce(self, net_pool: ThreadPoolExecutor,
+                 io_pool: ThreadPoolExecutor,
+                 pending: List[InventoryItem], ctx: "_RunContext") -> None:
+        """Submit downloads one at a time, gated by disk headroom + byte budget."""
+        for item in pending:
+            if self._abort is not None:
+                break
+            self._check_disk(item.size)
+            self._budget.acquire(item.size)  # never submit-all (T3)
+            net_pool.submit(self._net_job, io_pool, ctx, item)
+
+    # -- stage 2: network -----------------------------------------------------
+
+    def _net_job(self, io_pool: ThreadPoolExecutor, ctx: "_RunContext",
+                 item: InventoryItem) -> None:
+        """Fetch with retry, then hand the file to the io stage."""
+        if self._abort is not None:
+            return
+        self._gate.acquire()
+        with self._active_lock:
+            self._active += 1
+            self._peak_active = max(self._peak_active, self._active)
+        try:
+            if self.journal is not None:
+                self.journal.mark(item.key, "DOWNLOADING")
+            cache_path, from_cache, t_dl = self._download_with_retry(item)
+            if self.journal is not None:
+                self.journal.mark(item.key, "DOWNLOADED")
+            self._note_downloaded(cache_path, from_cache, t_dl)
+            with self._io_lock:
+                self._io_submitted += 1
+            io_pool.submit(self._io_job, ctx, item, cache_path, from_cache, t_dl)
+        except BaseException as exc:  # noqa: BLE001 - must not kill the pool
+            self._set_abort(exc)
+        finally:
+            with self._active_lock:
+                self._active -= 1
+            self._gate.release(ok=self._abort is None)
+
+    def _note_downloaded(self, cache_path: str, from_cache: bool,
+                         t_dl: float) -> None:
+        """Record one completed fetch. Cache hits never count as network bytes."""
+        with self._metrics_lock:
+            self.metrics.n_downloaded += 1
+            if not from_cache:
+                self.metrics.network_bytes += \
+                    os.path.getsize(cache_path) if os.path.exists(cache_path) else 0
+            self.metrics.t_download_s += t_dl
+
+    # -- stage 3: verify + stage ----------------------------------------------
+
+    def _io_job(self, ctx: "_RunContext", item: InventoryItem,
+                cache_path: str, from_cache: bool, t_dl: float) -> None:
+        """Verify, stage, run the bounded ``on_staged`` hook, then enqueue."""
+        try:
+            res = self._verify_and_stage(item, cache_path, from_cache, t_dl,
+                                         ctx.staged_name)
+            with self._metrics_lock:
+                self.metrics.t_verify_stage_s += res.t_verify_stage_s
+            if ctx.on_staged is not None:
+                # Earliest safe point: bytes are staged and verified, but not
+                # yet queued. Bounding work belongs HERE so a staged file never
+                # sits idle occupying disk.
+                ctx.on_staged(res)
+            self._ready.put(res)  # blocks when full: backpressure (T4)
+        except BaseException as exc:  # noqa: BLE001
+            self._set_abort(exc)
+        finally:
+            self._budget.release(item.size)
+            with self._io_lock:
+                self._io_done += 1
+
+    # -- stage 4: drain (the single ordered writer) ---------------------------
+
+    def _io_drained(self) -> bool:
+        with self._io_lock:
+            return (not self._io_open
+                    and self._io_done >= self._io_submitted)
+
+    def _drain(self, ctx: "_RunContext") -> None:
+        """Collect verified results in completion order and hand each off.
+
+        This thread is the only writer of ``ctx.ordered``, which is what keeps
+        out-of-order completion from changing manifest order.
+        """
+        try:
+            deadline = time.monotonic() + 3600
+            while time.monotonic() < deadline:
+                if self._io_drained() and self._ready.empty():
+                    break
+                try:
+                    res = self._ready.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if self._abort is None:
+                    self._collect(res, ctx)
+        except BaseException as exc:  # noqa: BLE001 - surface in caller
+            self._set_abort(exc)
+            ctx.drainer_exc.append(exc)
+
+    def _collect(self, res: DownloadResult, ctx: "_RunContext") -> None:
+        """Record one result and fire the serial ``on_ready`` handoff."""
+        ctx.ordered[res.index] = res
+        with self._metrics_lock:
+            self.metrics.peak_ready_depth = max(
+                self.metrics.peak_ready_depth, self._ready.qsize())
+        if ctx.on_ready is not None:
+            # Serial per-file handoff, coupled to consumption: a slow observer
+            # throttles the drain, the bounded queue throttles io, the byte
+            # budget throttles the producer — bounded memory end to end (T4).
+            ctx.on_ready(res)
+
+    # -- outcome --------------------------------------------------------------
+
+    def _finalize_metrics(self, items: List[InventoryItem],
+                          t_start: float) -> None:
+        with self._metrics_lock:
+            self.metrics.peak_active_downloads = self._peak_active
+            self.metrics.breaker_trips = self._gate.trips
+            self.metrics.n_items = len(items)
+            self.metrics.wall_s = time.monotonic() - t_start
+            self.metrics.peak_rss_mb = _peak_rss_mb()
+
+    def _resolve_outcome(self, items: List[InventoryItem],
+                         ctx: "_RunContext") -> List[DownloadResult]:
+        """Raise the run's first real fault, else return results in order."""
+        if ctx.drainer_exc:
             # A failing handoff observer propagates raw (as when the drain ran
             # on the calling thread); abort mapping below is for stage faults.
-            raise drainer_exc[0]
+            raise ctx.drainer_exc[0]
         if self._abort is not None:
-            exc = self._abort
-            if isinstance(exc, (PermanentDownloadError, DiskFullError,
-                                RamGuardError, FailedVerificationError,
-                                EmptyInventoryError)):
-                raise exc
-            if isinstance(exc, KeyboardInterrupt):
-                raise exc
-            raise BatchIncompleteError([f"{type(exc).__name__}: {exc}"]) from exc
-        missing = [it.path_in_repo for it in items if it.index not in ordered]
+            self._raise_mapped_abort()
+        missing = [it.path_in_repo for it in items if it.index not in ctx.ordered]
         if missing:
             raise BatchIncompleteError(missing)
-        return [ordered[it.index] for it in items]
+        return [ctx.ordered[it.index] for it in items]
+
+    def _raise_mapped_abort(self) -> None:
+        """Re-raise the abort; typed stage faults keep their own identity."""
+        exc = self._abort
+        if isinstance(exc, _TYPED_FAULTS + (KeyboardInterrupt,)):
+            raise exc
+        raise BatchIncompleteError([f"{type(exc).__name__}: {exc}"]) from exc
 
 
 def download_snapshot_dry_run(repo_id: str, revision_sha: str, token: Optional[str],
