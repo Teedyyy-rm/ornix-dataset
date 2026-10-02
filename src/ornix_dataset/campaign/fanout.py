@@ -31,6 +31,7 @@ from ..publishing.approval import release_digest
 from ..util.jsonl import load_jsonl
 from ..util.timeutil import utc_now_iso
 from ..version import __version__
+from .publishing import path_prefix_for, staging_revision_for
 
 DEFAULT_CHUNK = 100
 
@@ -100,6 +101,10 @@ def fanout_releases(store: Any, job_id: str, batch_id: str, *,
         if art.ready:
             rec["digest"] = release_digest(out_dir)
         releases.append(rec)
+        _write_release_record(store, job, batch, rec, campaign_id=None,
+                              revision=staging_revision_for(rid),
+                              path_prefix=path_prefix_for(rid),
+                              release_target=release_target)
 
     ready = [r for r in releases if r["ready"]]
     return {"ok": bool(ready), "job_id": job.job_id, "batch_id": batch.batch_id,
@@ -108,6 +113,42 @@ def fanout_releases(store: Any, job_id: str, batch_id: str, *,
             "out_root": out_root, "releases": releases,
             "generated_utc": utc_now_iso(),
             "analyzer_version": __version__}
+
+
+def _write_release_record(store: Any, job: Any, batch: Any,
+                          rec: Dict[str, Any], *, campaign_id: Optional[str],
+                          revision: str, path_prefix: str,
+                          release_target: str) -> str:
+    """Persist the same ``<release_id>.RELEASE.json`` the publisher reads.
+
+    ``publish_release`` resolves a release through this record, so a fan-out
+    chunk must have one too — otherwise the chunk has a directory and a digest
+    but no addressable release.
+    """
+    from .publishing import record_path_for
+
+    payload = {
+        "release_id": rec["release_id"],
+        "campaign_id": campaign_id or job.campaign_id,
+        "job_id": job.job_id,
+        "batch_id": batch.batch_id,
+        "fanout_index": rec["index"],
+        "repo_target": (getattr(store, "_destination_repo", None)),
+        "revision": revision,
+        "path_prefix": path_prefix,
+        "ready": bool(rec["ready"]),
+        "blockers": list(rec["blockers"]),
+        "n_rows": rec["n_rows"],
+        "release_dir": rec["release_dir"],
+        "digest": rec.get("digest"),
+        "release_target": release_target,
+        "prepared_utc": utc_now_iso(),
+    }
+    path = record_path_for(store, rec["release_id"])
+    from ..util.io import write_json
+
+    write_json(path, payload)
+    return path
 
 
 def fanout_dir_for(store: Any, job_id: str, batch_id: str) -> str:
