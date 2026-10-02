@@ -15,7 +15,7 @@
 |---|---|---|---|
 | 0 | Source registry, rights matrix, permission gate, schema/policy draft | ✅ VERIFIED (tooling) · ⏳ AWAITING_APPROVAL (scope-freeze sign-off) | `ingestion/permissions.py`, `configs/sources.example.yaml`; T-012 |
 | 1 | Local + HF read-only adapters, immutable staging, idempotent manifest, HF materialize | ✅ VERIFIED | `ingestion/`, `pipeline.ingest_and_stage`, `hf.materialize` (download→content-sha→immutable); idempotency + materialize mock tests |
-| 2 | Technical WAV gate + source admission (rate-class/codec) + canonical 24k mono PCM16 renderer + post-render verify | ✅ VERIFIED | `dsp/` (decode/resample/features/technical/**admission**/render); T-008/T-009/T-010 + T1..T20 admission/canonicalization (`tests/unit/test_admission.py`, `test_render_verify.py`, `tests/integration/test_codec_admission.py`) |
+| 2 | Technical WAV gate + source admission (rate-class/codec) + canonical native-rate mono PCM16 renderer + post-render verify | ✅ VERIFIED | `dsp/` (decode/features/technical/**admission**/render); T-008/T-009/T-010 + T1..T20 admission/canonicalization (`tests/unit/test_admission.py`, `test_render_verify.py`, `tests/integration/test_codec_admission.py`) |
 | 3 | VAD, windowing, event/noise + music detectors (pluggable, fail-closed) | ✅ INFRA_VERIFIED · ⚠️ REAL_MODEL: Silero/DNSMOS tải+pin+chạy thật (test_real_models); PANNs music + pyannote overlap vẫn AWAITING (torch/gated token) | `detectors/`, `config.build_detectors`; registry + DSP-never-music + real-ONNX load/run tests |
 | 4 | Quality/overlap/transcript adapters + calibration flow | ✅ INFRA_VERIFIED (runner + `calibrate` CLI + separation guard) · ⏳ AWAITING_APPROVAL (CALIBRATION_NOT_PERFORMED: cần gold-set nhãn người + ngưỡng operator ký) | `calibration/` (goldset/metrics/**runner**), `detectors/quality.py`, `detectors/speaker.py`; calibration runner + leakage tests |
 | 5 | Deterministic policy engine, review, segmentation (snap-to-silence), LSH dedup, leakage-safe split | ✅ VERIFIED | `curation/`; T-001..T-007, T-011, segmentation snap+uncertain, LSH-scale dedup, determinism + split-leakage tests |
@@ -29,7 +29,7 @@
 
 ## 0. Đọc trước khi triển khai: mục tiêu và giới hạn
 
-**Mục tiêu cuối:** tạo một *bộ công cụ lựa chọn dữ liệu giọng nói sạch*, nhập file từ nhiều nguồn, xác định nhiễu và lỗi chất lượng, chỉ giữ các đoạn/file đáp ứng chính sách để train Ornix lâu dài, chuẩn hóa output 24 kHz mono PCM16 WAV, tạo metadata và các shard phù hợp streaming; chỉ **phát hành các bản ghi được cấp quyền phân phối** lên Hugging Face (HF). Dữ liệu bị nhiễu mạnh phải **bỏ qua khỏi release**, không có nghĩa là xóa nguồn. Dữ liệu `REVIEW`, `ERROR`, `UNKNOWN` không được tự động upload vào tập sạch.
+**Mục tiêu cuối:** tạo một *bộ công cụ lựa chọn dữ liệu giọng nói sạch*, nhập file từ nhiều nguồn, xác định nhiễu và lỗi chất lượng, chỉ giữ các đoạn/file đáp ứng chính sách để train Ornix lâu dài, chuẩn hóa output mono PCM16 WAV **giữ tần số gốc của nguồn (không resample)**, tạo metadata và các shard phù hợp streaming; chỉ **phát hành các bản ghi được cấp quyền phân phối** lên Hugging Face (HF). Dữ liệu bị nhiễu mạnh phải **bỏ qua khỏi release**, không có nghĩa là xóa nguồn. Dữ liệu `REVIEW`, `ERROR`, `UNKNOWN` không được tự động upload vào tập sạch.
 
 Các loại lỗi ưu tiên: **nhạc nền đồng thời với lời nói; tiếng xì/rè/static/hum/buzz; tiếng quạt/xe/máy/gió; tiếng người khác nói chồng; clipping/vỡ tiếng; méo do codec hoặc khử nhiễu; tiếng vang nặng; file không có lời nói; transcript không khớp**. Công cụ nhằm *tuyển chọn*, **không** mặc định biến audio nhiễu thành audio sạch bằng denoise. Giữ nguyên nội dung phát âm, âm cuối và thanh điệu tiếng Việt; không đánh đồng “sạch” với “đọc đều, ít cảm xúc”.
 
@@ -39,7 +39,7 @@ Các loại lỗi ưu tiên: **nhạc nền đồng thời với lời nói; ti�
 
 | Chủ đề | Quyết định thiết kế | Điều phải kiểm chứng/chốt trước vận hành |
 |---|---|---|
-| Audio output | WAV, 24,000 Hz, mono, signed PCM16; lưu thông số và SHA-256 nguồn | Bản gốc 8/16 kHz upsample thành 24 kHz không phục hồi băng thông đã mất; chính sách nguồn âm thanh nào được chấp nhận phải được phê duyệt |
+| Audio output | WAV, mono, signed PCM16, **giữ tần số gốc của nguồn** (native rate, không resample); lưu thông số và SHA-256 nguồn | Nguồn dưới ngưỡng `native_min_sample_rate` bị **loại**, không upsample; nguồn rate cao hơn được giữ nguyên, không hạ mẫu; chính sách nguồn âm thanh nào được chấp nhận phải được phê duyệt |
 | Thời lượng | `duration_s <= 12.0` cho mỗi clip *cuối cùng* | `min_duration_s`, padding VAD, ngưỡng speech ratio và dung sai đo cần hiệu chỉnh/chốt; không tự đặt một con số rồi công bố chuẩn |
 | Nhiễu | Multi-label + timestamp + severity + nguồn bằng chứng | Chọn ngưỡng từng loại từ tập nghe gán nhãn, không mặc định SNR > 20 dB hay DNSMOS > 4 là PASS |
 | Chất lượng | `ACCEPT`, `REVIEW`, `REJECT`, `ERROR`, `LICENSE_REVIEW` | Chỉ `ACCEPT` sau tất cả hard gates và quyền phân phối; `ERROR` không phải `REJECT` do nhiễu |
@@ -120,38 +120,38 @@ flowchart TD
 
 ### 2.2 Source Audio Admission + Canonicalization (hợp đồng 2 tầng)
 
-Trước khi bỏ công canonicalize, pipeline chạy **Level 1 — Source Admission** để trả lời (từ số đo thật, **không** từ đuôi file): container/codec thật là gì, lossy hay lossless, sample rate đo được bao nhiêu, băng thông hữu ích ra sao, và nguồn có đủ điều kiện vào tập clean-HQ 24 kHz không. Chỉ nguồn đủ điều kiện mới qua **Level 2 — Canonicalization** rồi được **kiểm chứng lại sau khi ghi**.
+Trước khi bỏ công canonicalize, pipeline chạy **Level 1 — Source Admission** để trả lời (từ số đo thật, **không** từ đuôi file): container/codec thật là gì, lossy hay lossless, sample rate đo được bao nhiêu, băng thông hữu ích ra sao, và nguồn có đủ điều kiện vào tập clean-HQ (giữ native rate) không. Chỉ nguồn đủ điều kiện mới qua **Level 2 — Canonicalization** rồi được **kiểm chứng lại sau khi ghi**.
 
 Trước / sau khi có tầng này:
 
 ```
-# TRƯỚC (rủi ro): mọi src_sr < 24000 đều bị upsample lên 24k và nhận WAV "trông như 24k"
-raw -> technical gate -> segment -> render_canonical_wav (upsample bất kỳ) -> ACCEPT
+# TRƯỚC (rủi ro): mọi src_sr khác 24k đều bị resample và nhận WAV "trông như 24k"
+raw -> technical gate -> segment -> render_canonical_wav (resample bất kỳ) -> ACCEPT
 
-# SAU: cổng admission chặn narrowband/low-rate, kiểm chứng hậu-render, ghi provenance
+# SAU: cổng admission chặn nguồn dưới ngưỡng, kiểm chứng hậu-render, ghi provenance
 raw -> probe+decode -> technical gate -> SOURCE ADMISSION GATE
-        ├─ narrowband / low-bandwidth / (near-target khi policy cấm) -> REJECT_TECH (còn evidence)
-        ├─ băng thông nghi upsampled (24/44.1/48k mà eff_bw hẹp)      -> REVIEW (không silent ACCEPT)
-        └─ eligible -> segment -> canonicalize ONCE (decode→mono→resample→PCM16→WAV)
-                       -> POST-RENDER VERIFY (WAV/mono/PCM16/24k, SHA) -> ACCEPT-only
+        ├─ narrowband / low-bandwidth / dưới native_min -> REJECT_TECH (còn evidence)
+        ├─ băng thông nghi upsampled (rate cao mà eff_bw hẹp)          -> REVIEW (không silent ACCEPT)
+        └─ eligible -> segment -> canonicalize ONCE (decode→mono→PCM16→WAV, GIỮ rate gốc)
+                       -> POST-RENDER VERIFY (WAV/mono/PCM16 đúng rate, SHA) -> ACCEPT-only
 ```
 
 **Chính sách sample-rate (mặc định strict-HQ, cấu hình ở `configs/audio_profile.yaml → source_admission.clean_hq`, versioned):**
 
 | Rate class | Điều kiện (đo được) | Action | Vào clean-HQ? |
 |---|---|---|---|
-| `NATIVE_OR_HIGHER` | `sr >= 24000` | `IDENTITY` (==24k) hoặc `DOWNSAMPLE` (>24k), band-limited resample **một lần** | Có |
-| `NEAR_TARGET_UPSAMPLE` | `22050 <= sr < 24000` | `UPSAMPLE_NEAR_TARGET` (nếu `allow_near_target_upsample`), đánh dấu **không phải native 24k** | Có điều kiện |
+| `NATIVE_OR_HIGHER` | `sr >= 24000` | `IDENTITY` — giữ nguyên native rate, **không resample** | Có |
+| `BELOW_MIN_NATIVE` | `22050 <= sr < 24000` | `REJECT_BELOW_MIN_NATIVE` — không upsample | Không |
 | `LOW_BANDWIDTH_SOURCE` | `16000 <= sr < 22050` | `REJECT_LOW_BANDWIDTH` | Không (mặc định) |
 | `NARROWBAND_SOURCE` | `sr < 16000` (vd 8 kHz telephony) | `REJECT_NARROWBAND` | Không |
 
 **Chính sách codec/container:** phân loại **theo codec đo được, không theo đuôi file** — `.wav` có thể là PCM/μ-law/A-law/ADPCM; `.m4a` có thể là AAC (lossy) hoặc ALAC (lossless); `.ogg` có thể là Vorbis hoặc Opus. Nguồn lossy (MP3/AAC/Opus/Vorbis) **không** bị loại chỉ vì lossy: decode một lần, giữ `source_lossy=true` + `source_codec` trong provenance, và chuyển sang WAV **không** xóa cờ lossy hay khôi phục thông tin đã mất.
 
-**Băng thông hữu ích (target-aware):** so sánh `effective_bandwidth` với `min(source_nyquist, canonical_nyquist=12000)`, **không** mù quáng theo `source_sr/2`. Nhờ vậy giọng 48 kHz băng thông ~10 kHz **không** bị đánh oan (target 24 kHz vốn chỉ giữ tới 12 kHz), trong khi tín hiệu 8 kHz upsample vào container 24 kHz vẫn bị gắn cờ `SUSPECTED_UPSAMPLED_SOURCE` → REVIEW (không có ngưỡng cứng đã hiệu chỉnh nên định tuyến REVIEW thay vì bịa PASS/REJECT).
+**Băng thông hữu ích (capped):** so sánh `effective_bandwidth` với `min(source_nyquist, canonical_nyquist=12000)`, **không** mù quáng theo `source_sr/2`. Trần 12 kHz hiện là chính sách operator (xem `docs/PLAN-NATIVE-SAMPLE-RATE.md §6e`): nhờ vậy giọng 48 kHz băng thông ~10 kHz **không** bị đánh oan, trong khi tín hiệu 8 kHz upsample vào container 24 kHz vẫn bị gắn cờ `SUSPECTED_UPSAMPLED_SOURCE` → REVIEW (không có ngưỡng cứng đã hiệu chỉnh nên định tuyến REVIEW thay vì bịa PASS/REJECT).
 
-> **Vì sao upsample không "sửa" được chất lượng:** upsample là nội suy có band-limit — nó **không tạo thêm thông tin**. `24 kHz output ≠ native 24 kHz source`; nguồn 8/16 kHz vẫn là narrowband dù metadata ghi 24,000 Hz. Đây là các invariant I1/I2/I3/I4/I5/I9.
+> **Vì sao upsample không "sửa" được chất lượng:** upsample là nội suy có band-limit — nó **không tạo thêm thông tin**. Từ bản native-rate, pipeline **không upsample**: nguồn 8/16 kHz vẫn là narrowband và bị **loại**, không được "nâng" cho ra WAV trông như 24k; và nguồn rate cao cũng **không bị hạ mẫu** để mất nội dung thật. Đây là các invariant I1/I2/I3/I4/I5/I9.
 
-**Provenance** (schema `ornix-schema-v2`): `SourceRecord` mang `source_container/source_codec/source_lossy/source_rate_class`; `RenderRecipe` mang `canonicalization_action/resample_method/effective_bandwidth_hz/low_bandwidth_suspected/canonical_verify_status`; `QualityEvidence` mirror các trường này + `canonical_sha256`. Mỗi WAV canonical được **mở lại và chứng minh** WAV/mono/PCM16/24k trước khi trả về; verify fail → xóa artifact hỏng + fail-closed (ERROR), **không bao giờ** ACCEPT. Nguồn gốc bất biến (SHA không đổi, staging `0o444`).
+**Provenance** (schema `ornix-schema-v2`): `SourceRecord` mang `source_container/source_codec/source_lossy/source_rate_class`; `RenderRecipe` mang `canonicalization_action/output_sample_rate/effective_bandwidth_hz/low_bandwidth_suspected/canonical_verify_status`; `QualityEvidence` mirror các trường này + `canonical_sha256`. Mỗi WAV canonical được **mở lại và chứng minh** WAV/mono/PCM16 **đúng tần số đo được của nguồn** trước khi trả về; verify fail → xóa artifact hỏng + fail-closed (ERROR), **không bao giờ** ACCEPT. Nguồn gốc bất biến (SHA không đổi, staging `0o444`).
 
 
 ## 3. Taxonomy: phát hiện *loại* nhiễu và *mức ảnh hưởng*
@@ -191,7 +191,7 @@ Chỉ công bố ngưỡng sau calibration. Music detector trả điểm *không
 |---|---|---|---|
 | Decode/probe | FFmpeg/ffprobe, soundfile/libsndfile | Kiểm tra thông số thực; quản lý phiên bản FFmpeg, giới hạn bộ nhớ & duration | REQUIRED |
 | DSP | NumPy, SciPy, librosa khi thật sự cần | RMS, peak, DC, STFT, clipped runs, ước lượng noise floor; bằng chứng giới hạn | REQUIRED phần cơ bản |
-| VAD | Silero VAD (ONNX hoặc PyTorch) | Hỗ trợ 8/16 kHz: resample **bản analysis riêng** về 16 kHz; timestamp quy đổi đúng sang nguồn/24 kHz | Candidate REQUIRED sau benchmark |
+| VAD | Silero VAD (ONNX hoặc PyTorch) | Hỗ trợ 8/16 kHz: resample **bản analysis riêng** về 16 kHz; timestamp quy đổi đúng sang tọa độ nguồn (native rate) | Candidate REQUIRED sau benchmark |
 | Sound event | PANNs hoặc detector cùng mục tiêu | Tagging lớp speech/music/noise; nếu model chỉ trả tag toàn file thì thêm windowing, không giả time interval | Candidate REQUIRED cho music gate |
 | Phân loại bổ trợ | CLAP hoặc mô hình âm thanh được kiểm chứng | Similarity không phải posterior xác suất; benchmark trên tiếng Việt, không auto-approve | OPTIONAL |
 | Quality | DNSMOS P.835 hoặc NR-SQA thay thế | SIG/BAK/OVRL, model sample rate & duration requirement; **xác minh license code + weights riêng** | Candidate REQUIRED khi được cấp quyền |
@@ -343,11 +343,11 @@ ornix-dataset publish verify --repo-id ... --commit-sha ...
 
 ### Phase 2 — Technical WAV gate & canonical audio renderer
 
-**Phụ thuộc:** 1. **Goal:** loại file kỹ thuật hỏng, tạo audio output 24 kHz đúng cách.
+**Phụ thuộc:** 1. **Goal:** loại file kỹ thuật hỏng, tạo audio output mono PCM16 **giữ tần số gốc** đúng cách.
 
-**Build/Review:** ffprobe/soundfile decoder, duration/sample rate/channels thực, NaN/Inf/no-speech-level, RMS/peak, DC/clipped-run/discontinuity diagnostics. Resample polyphase/band-limited, mono downmix có chính sách (kiểm tra phase cancellation) và 16-bit conversion có clipping guard; giữ raw, hash output, đo lại sample rate/duration. Chỉ render khi có đoạn ứng viên được xác thực; với duration >12s, có thể chuyển sang segmentation thay vì tự reject toàn bộ nguồn dài.
+**Build/Review:** ffprobe/soundfile decoder, duration/sample rate/channels thực, NaN/Inf/no-speech-level, RMS/peak, DC/clipped-run/discontinuity diagnostics. **Giữ nguyên native rate (không resample)**, mono downmix có chính sách (kiểm tra phase cancellation) và 16-bit conversion có clipping guard; giữ raw, hash output, đo lại sample rate/duration. Chỉ render khi có đoạn ứng viên được xác thực; với duration >12s, có thể chuyển sang segmentation thay vì tự reject toàn bộ nguồn dài.
 
-**Deliverables:** technical evidence, renderer recipe, codec provenance, CPU fixtures. **Tests:** 8k/16k/24k/44.1k/48k WAV, MP3 disguised as WAV, stereo anti-phase, empty, corrupt, clipped input, NaN, quá ngắn/dài, boundary 12s, resampling không chỉ sửa header; sample-count vs duration tolerance. **Acceptance:** output thực 24k mono PCM16, không lỗi kỹ thuật được silent PASS. **STOP:** resampler phá âm, mất source provenance.
+**Deliverables:** technical evidence, renderer recipe, codec provenance, CPU fixtures. **Tests:** 8k/16k/24k/44.1k/48k WAV, MP3 disguised as WAV, stereo anti-phase, empty, corrupt, clipped input, NaN, quá ngắn/dài, boundary 12s, rate khác 24k được giữ nguyên (không resample); sample-count vs duration tolerance. **Acceptance:** output thực mono PCM16 đúng rate đo được của nguồn, không lỗi kỹ thuật được silent PASS. **STOP:** mất source provenance hoặc rate bị ghi sai.
 
 ### Phase 3 — VAD, windowing và event/noise detector
 

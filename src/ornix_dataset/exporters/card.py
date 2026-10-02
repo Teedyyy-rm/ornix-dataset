@@ -40,7 +40,7 @@ required quality gates and carries explicit redistribution rights.
 - Approx. hours: **{total_hours}**
 - Languages: {", ".join(langs)}
 - Splits: {", ".join(splits)}
-- Audio format: 24 kHz, mono, PCM_S16LE WAV
+- Audio format: mono, PCM_S16LE WAV at each source's native sample rate
 
 ## Provenance & rights
 Sources retain their original attribution and license. This release contains
@@ -57,8 +57,8 @@ operator-signed after calibration on a human-labeled gold set. See
 ## Limitations
 - Detector coverage is bounded by the licensed models available at build time;
   `UNKNOWN` was never promoted to `ACCEPT`.
-- Upsampled/low-bandwidth sources are flagged and excluded from "native 24 kHz"
-  claims.
+- Low-bandwidth/upsampled sources are flagged and excluded; clips are never
+  resampled or upsampled.
 - Not a proof of absolute noise-free audio; metrics are evidence, not guarantees.
 
 ## Splits & leakage

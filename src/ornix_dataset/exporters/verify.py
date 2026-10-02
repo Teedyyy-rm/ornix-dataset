@@ -1,8 +1,9 @@
 """Offline release verification (spec §6, Phase 6, tests T-015).
 
-Checks: every manifest row maps to a present audio file; readback confirms 24 kHz
-mono PCM16 and matching audio_sha256; no absolute/local paths or secrets; row
-count and total duration reconcile; MANIFEST.sha256 matches on disk.
+Checks: every manifest row maps to a present audio file; readback confirms mono
+PCM16 at the manifest row's sample rate and matching audio_sha256; no
+absolute/local paths or secrets; row count and total duration reconcile;
+MANIFEST.sha256 matches on disk.
 """
 
 from __future__ import annotations
@@ -47,7 +48,7 @@ def verify_release(release_dir: str, offline: bool = True) -> VerifyResult:
             continue
         if sha256_file(audio_path) != r.get("audio_sha256"):
             errors.append(f"SHA_MISMATCH:{aid}")
-        _check_wav(audio_path, aid, errors)
+        _check_wav(audio_path, aid, errors, expected_sr=r.get("sample_rate"))
         total_dur += float(r.get("duration_s", 0.0))
 
     _check_secrets(release_dir, errors)
@@ -56,11 +57,20 @@ def verify_release(release_dir: str, offline: bool = True) -> VerifyResult:
     return VerifyResult(not errors, errors, len(rows), round(total_dur, 3))
 
 
-def _check_wav(path: str, aid: str, errors: List[str]) -> None:
+def _check_wav(path: str, aid: str, errors: List[str],
+               expected_sr: Any = None) -> None:
+    """Readback: the file must carry the row's declared rate (fail-closed when
+    the manifest omits it) and be mono PCM16."""
+    try:
+        expected = int(expected_sr)
+    except (TypeError, ValueError):
+        expected = None
     try:
         with wave.open(path, "rb") as wf:
-            if wf.getframerate() != 24000:
-                errors.append(f"SR_NOT_24K:{aid}")
+            if expected is None or expected <= 0:
+                errors.append(f"SR_MISSING:{aid}")
+            elif wf.getframerate() != expected:
+                errors.append(f"SR_MISMATCH:{aid}:{wf.getframerate()}!={expected}")
             if wf.getnchannels() != 1:
                 errors.append(f"NOT_MONO:{aid}")
             if wf.getsampwidth() != 2:

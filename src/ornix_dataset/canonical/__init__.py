@@ -9,6 +9,17 @@ from .bridge import (
     scope_of,
 )
 from .card import render_card, write_card
+from .handoff import (
+    HANDOFF_FIELDS,
+    HANDOFF_NAME,
+    HandoffError,
+    HandoffRow,
+    build_handoff_rows,
+    validate_consent,
+    validate_handoff_row,
+    validate_license,
+    write_handoff_manifest,
+)
 from .identity import (
     IDENTITY_SCHEMA,
     CanonicalState,
@@ -64,6 +75,10 @@ from .verify import CanonicalVerifyResult, verify_canonical_dataset
 __all__ = [
     "AUDIO_PATH_RE",
     "CANONICAL_FIELDS",
+    "HANDOFF_FIELDS",
+    "HANDOFF_NAME",
+    "HandoffError",
+    "HandoffRow",
     "IDENTITY_SCHEMA",
     "MANIFEST_NAME",
     "METADATA_NAME",
@@ -82,6 +97,7 @@ __all__ = [
     "SchemaError",
     "audio_abs_path",
     "audio_path_for",
+    "build_handoff_rows",
     "dataset_inventory",
     "export_campaign_batch",
     "export_run",
@@ -106,8 +122,12 @@ __all__ = [
     "speaker_scope_key",
     "split_stats",
     "upsert_rows",
+    "validate_consent",
+    "validate_handoff_row",
+    "validate_license",
     "verify_canonical_dataset",
     "write_card",
+    "write_handoff_manifest",
     "write_manifest_sha",
     "write_ready",
     "write_split_rows",

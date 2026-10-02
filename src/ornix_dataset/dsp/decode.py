@@ -99,7 +99,11 @@ def _decode_ffmpeg(path: str, mono: bool, timeout: float) -> AudioBuffer:
         raise DecodeError("ffmpeg not available and soundfile decode failed")
     info = ffprobe_info(path)
     ch = 1 if mono else max(1, info.get("channels") or 1)
-    sr = info.get("sample_rate") or 24000
+    sr = info.get("sample_rate")
+    if not sr or int(sr) <= 0:
+        raise DecodeError(
+            "ffprobe returned no usable sample_rate; refusing to guess a decode "
+            "rate (fail-closed)")
     cmd = ["ffmpeg", "-v", "error", "-i", path, "-f", "f32le", "-acodec", "pcm_f32le",
            "-ac", str(ch), "-ar", str(sr), "-"]
     try:

@@ -135,7 +135,8 @@ rejected; and the full existing regression suite.
 
 - No live HF upload is performed or claimed here (`REMOTE_UPLOAD_UNVERIFIED`):
   the publish path is exercised against the in-memory `FakeHub` only.
-- `duration`/readback are verified on real 24 kHz mono PCM16 WAVs; other formats
+- `duration`/readback are verified on real mono PCM16 WAVs (native source rate,
+  kept as-is by the canonical renderer); other formats
   must first pass the existing canonical renderer.
 - Speaker identity is only as trustworthy as the source's declared speaker ref;
   unverified speakers are deliberately over-split, never over-merged.

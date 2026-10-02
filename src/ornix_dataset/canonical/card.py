@@ -102,8 +102,8 @@ VAD/windowing → noise/quality/speaker detectors → deterministic policy → s
 ## Known limitations
 - Detector coverage is bounded by the licensed models available at build time;
   `UNKNOWN` is never promoted to `ACCEPT`.
-- Upsampled/low-bandwidth sources are flagged and excluded from "native 24 kHz"
-  claims.
+- Low-bandwidth/upsampled sources are flagged and excluded; clips are never
+  resampled or upsampled.
 - Metrics are evidence, not proof of absolute noise-free audio.
 
 ## License, rights & attribution

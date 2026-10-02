@@ -29,9 +29,9 @@ class TechnicalThresholds:
     min_rms: float = 1e-4  # below -> effectively silent / no speech level
     duration_tolerance_s: float = 0.05
     bandwidth_ratio_warn: float = 0.45  # eff_bw / ref_nyq below this -> low bandwidth
-    # Target-aware bandwidth reference: reason relative to the useful canonical
-    # Nyquist, not blindly source_sr/2. A 48 kHz speech clip band-limited to
-    # ~10 kHz is fine because the 24 kHz target only preserves up to 12 kHz; an
+    # Capped bandwidth reference: reason relative to the useful canonical
+    # Nyquist cap, not blindly source_sr/2. A 48 kHz speech clip band-limited to
+    # ~10 kHz is fine under the operator's 12 kHz reference cap; an
     # 8 kHz signal upsampled into a 24 kHz container is still flagged.
     canonical_nyquist_hz: float = 12000.0
 
@@ -183,9 +183,10 @@ def _evaluate(
     if abs(stats.dc_offset) > t.max_dc_offset:
         reasons.append(f"DC_OFFSET:{stats.dc_offset:.4f}")
 
-    # header vs measured sample-rate / bandwidth mismatch (T-008), target-aware:
-    # compare against min(source_nyquist, canonical_nyquist) so a high-rate clean
-    # source is not penalised for lacking energy the 24 kHz target discards anyway.
+    # header vs measured sample-rate / bandwidth mismatch (T-008), capped:
+    # compare against min(source_nyquist, canonical_nyquist) so a clean high-rate
+    # source is not penalised for lacking energy above the heuristic's reference cap
+    # (kept as operator policy; revisit under the native-rate release, plan §6e).
     if eff_bw is not None and sr > 0:
         ref_nyq = min(sr / 2.0, t.canonical_nyquist_hz)
         if eff_bw < t.bandwidth_ratio_warn * ref_nyq:

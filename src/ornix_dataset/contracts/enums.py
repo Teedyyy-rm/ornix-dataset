@@ -49,8 +49,8 @@ class SourceRateClass(str, Enum):
     project-policy defaults held in ``configs/audio_profile.yaml``.
     """
 
-    NATIVE_OR_HIGHER = "NATIVE_OR_HIGHER"        # sr >= canonical (24k)
-    NEAR_TARGET_UPSAMPLE = "NEAR_TARGET_UPSAMPLE"  # conditional_min <= sr < canonical
+    NATIVE_OR_HIGHER = "NATIVE_OR_HIGHER"        # sr >= native_min (admitted at native rate)
+    BELOW_MIN_NATIVE = "BELOW_MIN_NATIVE"        # conditional_min <= sr < native_min
     LOW_BANDWIDTH_SOURCE = "LOW_BANDWIDTH_SOURCE"  # low_bw_min <= sr < conditional_min
     NARROWBAND_SOURCE = "NARROWBAND_SOURCE"        # sr < low_bw_min
 
@@ -58,9 +58,8 @@ class SourceRateClass(str, Enum):
 class CanonicalizationAction(str, Enum):
     """What the canonicalization stage does (or refuses to do) for a source."""
 
-    IDENTITY = "IDENTITY"
-    DOWNSAMPLE = "DOWNSAMPLE"
-    UPSAMPLE_NEAR_TARGET = "UPSAMPLE_NEAR_TARGET"
+    IDENTITY = "IDENTITY"                        # kept at the source's native rate
+    REJECT_BELOW_MIN_NATIVE = "REJECT_BELOW_MIN_NATIVE"
     REJECT_LOW_BANDWIDTH = "REJECT_LOW_BANDWIDTH"
     REJECT_NARROWBAND = "REJECT_NARROWBAND"
     ERROR = "ERROR"

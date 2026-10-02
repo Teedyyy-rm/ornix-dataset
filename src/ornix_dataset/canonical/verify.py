@@ -4,8 +4,9 @@ Fail-closed checks, all against bytes on disk:
 
 - every metadata row has exactly the six fields, ``audio == file_name`` and a
   canonical sharded path;
-- every referenced WAV exists, is 24 kHz mono PCM16, and its measured duration
-  matches the row (no dangling metadata);
+- every referenced WAV exists, is mono PCM16 with a readable sample rate (the
+  per-file rate lives in the release manifest, not the six-field metadata), and
+  its measured duration matches the row (no dangling metadata);
 - every WAV under ``<split>/audio`` has exactly one row (no orphan WAV);
 - no duplicate rows and no sample appearing in more than one split;
 - the checksum manifest and READY marker (when present) are consistent.
@@ -45,8 +46,8 @@ def _measured_duration_s(path: str) -> float:
 def _check_wav_shape(path: str, errors: List[str], tag: str) -> None:
     try:
         with wave.open(path, "rb") as wf:
-            if wf.getframerate() != 24000:
-                errors.append(f"SR_NOT_24K:{tag}")
+            if wf.getframerate() <= 0:
+                errors.append(f"BAD_SAMPLE_RATE:{tag}")
             if wf.getnchannels() != 1:
                 errors.append(f"NOT_MONO:{tag}")
             if wf.getsampwidth() != 2:

@@ -20,8 +20,15 @@ from . import card, layout
 
 
 def finalize_dataset(dataset_dir: str, rights: Optional[Dict[str, Any]] = None,
-                     changelog: str = "") -> Dict[str, Any]:
-    """(Re)write card + checksum manifest + READY marker from current rows."""
+                     changelog: str = "",
+                     state_dir: Optional[str] = None) -> Dict[str, Any]:
+    """(Re)write card + checksum manifest + READY marker from current rows.
+
+    When ``state_dir`` is given, the Ornix-TTS handoff manifest is (re)written
+    first so the checksum manifest covers it. Fail-closed: if the handoff cannot
+    be produced with verified rights, nothing is finalized and no READY marker
+    is written.
+    """
     stats = layout.split_stats(dataset_dir)
     if rights is None:
         # preserve the rights summary recorded at export time rather than wiping
@@ -36,13 +43,22 @@ def finalize_dataset(dataset_dir: str, rights: Optional[Dict[str, Any]] = None,
                 rights = {}
     if stats["n_rows"] == 0:
         return {"ok": False, "reason": "no-rows"}
+    handoff: Dict[str, Any] = {"written": False, "reason": "NO_STATE_DIR"}
+    if state_dir:
+        try:
+            from .handoff import write_handoff_manifest
+
+            path, rows = write_handoff_manifest(dataset_dir, state_dir)
+            handoff = {"written": True, "path": path, "n_rows": len(rows)}
+        except Exception as e:  # fail-closed: never finalize without the handoff
+            return {"ok": False, "reason": f"handoff-failed: {e}"}
     card.write_card(dataset_dir, stats, rights, changelog)
     # READY before MANIFEST: the checksum manifest must cover the readiness
     # marker itself, otherwise the first finalize produces a manifest that
     # differs from every later one (READY missing) and digests never converge.
     layout.write_ready(dataset_dir, stats, rights)
     layout.write_manifest_sha(dataset_dir)
-    return {"ok": True, **stats}
+    return {"ok": True, **stats, "handoff": handoff}
 
 
 def dataset_inventory(dataset_dir: str) -> Dict[str, str]:

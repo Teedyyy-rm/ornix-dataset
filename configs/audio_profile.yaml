@@ -1,6 +1,9 @@
-# Canonical audio output profile (spec §0.1). These are fixed release invariants.
+# Canonical audio output profile (spec §0.1). Released audio is mono PCM16 WAV
+# kept at each source's NATIVE sample rate — the canonical path never resamples
+# (analysis detectors resample internally to their model rates; that is separate).
+# This block is documentation-only: no loader reads it yet.
 audio_output:
-  sample_rate: 24000
+  sample_rate: native         # native | fixed (fixed is not implemented)
   channels: 1
   encoding: PCM_S16LE
   downmix_policy: mean        # mean | first (checked for phase cancellation)
@@ -15,18 +18,18 @@ technical_thresholds:
   min_rms: 0.0001
   duration_tolerance_s: 0.05
   bandwidth_ratio_warn: 0.5           # eff_bw/ref_nyq below this -> low-bandwidth flag
-  canonical_nyquist_hz: 12000         # target-aware bandwidth reference (24 kHz Nyquist)
+  canonical_nyquist_hz: 12000         # cap for the low-bandwidth heuristic (operator
+                                      # policy; revisit under native rates — plan §6e)
 
 # Level 1 — Source Audio Admission (clean-HQ eligibility). Project-policy defaults,
-# NOT universal audio standards; any change is a versioned config change. Upsampling
-# a low-rate/narrowband source does NOT restore lost bandwidth: a file is never
-# admitted merely because its output would say 24,000 Hz.
+# NOT universal audio standards; any change is a versioned config change. The release
+# keeps measured native sample rates and never resamples: a file below
+# native_min_sample_rate is rejected rather than upsampled, and a clean higher-rate
+# source is admitted as-is rather than decimated.
 source_admission:
   clean_hq:
-    canonical_sample_rate: 24000
-    native_min_sample_rate: 24000        # >= this: NATIVE_OR_HIGHER (identity/downsample)
-    conditional_min_sample_rate: 22050   # [22050,24000): NEAR_TARGET_UPSAMPLE (conditional)
-    low_bandwidth_min_sample_rate: 16000 # [16000,22050): LOW_BANDWIDTH_SOURCE
-    allow_near_target_upsample: true     # 22.05 kHz allowed but marked non-native
+    native_min_sample_rate: 24000        # >= this: NATIVE_OR_HIGHER, admitted at native rate
+    conditional_min_sample_rate: 22050   # [22050,24000): BELOW_MIN_NATIVE -> rejected
+    low_bandwidth_min_sample_rate: 16000 # [16000,22050): LOW_BANDWIDTH_SOURCE -> rejected
     reject_low_bandwidth_from_clean_hq: true   # 16 kHz rejected from strict HQ
     reject_narrowband_from_clean_hq: true      # < 16 kHz (e.g. 8 kHz telephony) rejected

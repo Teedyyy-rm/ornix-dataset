@@ -1,6 +1,7 @@
 """Permission gate + contracts + render + ops tests."""
 
 import os
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -11,6 +12,11 @@ from ornix_dataset.contracts.release import ReleaseRow
 from ornix_dataset.ingestion.permissions import PermissionGate
 from ornix_dataset.dsp import decode_to_float, render_canonical_wav
 from ornix_dataset.ops import Checkpoint, ContentCache, cache_key, takedown_plan
+
+
+def _adm(action="IDENTITY"):
+    """Minimal admission stub — render requires the measured action (never guesses)."""
+    return SimpleNamespace(canonicalization_action=action)
 
 
 def test_t012_unknown_rights_quarantine():
@@ -72,12 +78,23 @@ def test_render_canonical_roundtrip(tmp_path):
     synth.write_wav(p, synth.speechlike(44100, 2.0), 44100)
     buf, _ = decode_to_float(p)
     out = str(tmp_path / "out.wav")
-    sha, recipe = render_canonical_wav(buf, out)
+    sha, recipe = render_canonical_wav(buf, out, admission=_adm())
     buf2, _ = decode_to_float(out)
-    assert buf2.sample_rate == 24000 and buf2.channels == 1
+    # native rate is preserved end-to-end; nothing is resampled to a canonical rate
+    assert buf2.sample_rate == 44100 and buf2.channels == 1
     assert abs(buf2.duration_s - 2.0) < 0.02
-    assert recipe.resample_method == "scipy-resample_poly"
+    assert recipe.output_sample_rate == 44100
     assert len(sha) == 64
+
+
+def test_decode_ffmpeg_missing_rate_fails_closed(tmp_path, monkeypatch):
+    from ornix_dataset.dsp import decode as decode_mod
+
+    monkeypatch.setattr(decode_mod.shutil, "which", lambda _: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(decode_mod, "ffprobe_info",
+                        lambda p: {"sample_rate": None, "channels": 1})
+    with pytest.raises(decode_mod.DecodeError):
+        decode_mod._decode_ffmpeg(str(tmp_path / "x.mp3"), mono=True, timeout=5)
 
 
 def test_cache_key_invalidates_on_weight_change():

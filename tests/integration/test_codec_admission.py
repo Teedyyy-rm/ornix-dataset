@@ -10,6 +10,7 @@ they self-skip only when ffmpeg is genuinely absent.
 import os
 import shutil
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,6 +24,11 @@ from ornix_dataset.util.hashing import sha256_file
 
 pytestmark = pytest.mark.skipif(shutil.which("ffmpeg") is None,
                                  reason="ffmpeg required for real codec admission tests")
+
+
+def _adm(action="IDENTITY"):
+    """Minimal admission stub — render requires the measured action (never guesses)."""
+    return SimpleNamespace(canonicalization_action=action)
 
 
 @pytest.fixture(autouse=True)
@@ -54,12 +60,15 @@ def test_t10_mp3_decodes_lossy_provenance_survives(tmp_path):
     mp3 = _encode(src, str(tmp_path / "a.mp3"), "-codec:a", "libmp3lame", "-b:a", "192k")
     report, adm = _classify(mp3)
     assert adm.source_lossy is True and adm.source_codec == "mp3"
-    assert adm.admitted and adm.canonicalization_action == "DOWNSAMPLE"
+    assert adm.admitted and adm.canonicalization_action == "IDENTITY"
     buf, _ = decode_to_float(mp3, mono=True)
     _, recipe = render_canonical_wav(buf, str(tmp_path / "c.wav"), admission=adm)
-    # conversion to WAV must NOT clear the lossy provenance
+    # conversion to WAV must NOT clear the lossy provenance, and the native
+    # 44.1 kHz rate is kept (no resample to a canonical rate)
     assert recipe.source_lossy is True
-    assert verify_canonical_wav(str(tmp_path / "c.wav"))[0]
+    assert recipe.output_sample_rate == 44100
+    assert verify_canonical_wav(str(tmp_path / "c.wav"),
+                                expected_sample_rate=44100)[0]
 
 
 def test_t11_aac_m4a_classified_by_codec(tmp_path):
@@ -101,7 +110,7 @@ def test_t19_original_source_bytes_immutable(tmp_path):
     mp3 = _encode(src, str(tmp_path / "a.mp3"), "-codec:a", "libmp3lame", "-b:a", "192k")
     before = sha256_file(mp3)
     buf, _ = decode_to_float(mp3, mono=True)
-    render_canonical_wav(buf, str(tmp_path / "c.wav"))
+    render_canonical_wav(buf, str(tmp_path / "c.wav"), admission=_adm())
     assert sha256_file(mp3) == before  # canonicalization never touches the source
 
 
@@ -111,14 +120,16 @@ def test_t20_release_row_invariant_holds(tmp_path):
     src = _wav(tmp_path, sr=48000)
     buf, _ = decode_to_float(src, mono=True)
     out = str(tmp_path / "c.wav")
-    audio_sha, _ = render_canonical_wav(buf, out)
+    audio_sha, recipe = render_canonical_wav(buf, out, admission=_adm())
     with wave.open(out, "rb") as wf:
         fr, ch, sw, n = wf.getframerate(), wf.getnchannels(), wf.getsampwidth(), wf.getnframes()
-    assert (fr, ch, sw) == (24000, 1, 2)
+    # native 48 kHz is kept end to end: file, recipe and release row must agree
+    assert (fr, ch, sw) == (48000, 1, 2)
+    assert recipe.output_sample_rate == 48000
     row = ReleaseRow(
         audio_id="ornix_vi_x", audio="audio/c.wav", language="vi", speaker_id="s",
-        transcript="t", sample_rate=24000, channels=1, encoding="PCM_S16LE",
-        duration_s=round(n / 24000, 6), source_id="SRC", source_sha256="a" * 64,
+        transcript="t", sample_rate=recipe.output_sample_rate, channels=1, encoding="PCM_S16LE",
+        duration_s=round(n / 48000, 6), source_id="SRC", source_sha256="a" * 64,
         audio_sha256=audio_sha, segment_start_sample_source=0,
         segment_end_sample_source=n, rights_record_id="R", quality_evidence_id="Q",
         quality_policy_version="v", quality_gate="ACCEPT", split="train",

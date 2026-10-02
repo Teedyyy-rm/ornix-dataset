@@ -686,9 +686,25 @@ def cmd_canonical_verify(args) -> int:
 def cmd_canonical_finalize(args) -> int:
     from .canonical import finalize_dataset
 
-    rep = finalize_dataset(args.dataset)
+    rep = finalize_dataset(args.dataset, state_dir=getattr(args, "state", None))
     _print(rep)
     return 0 if rep.get("ok") else 3
+
+
+def cmd_canonical_handoff(args) -> int:
+    from .canonical import HandoffError, write_handoff_manifest
+
+    try:
+        path, rows = write_handoff_manifest(
+            args.dataset, args.state,
+            require_verified_license=not args.allow_unverified_license)
+    except HandoffError as e:
+        _print({"ok": False, "error": str(e), "manifest": None})
+        return 3
+    _print({"ok": True, "manifest": path, "n_rows": len(rows),
+            "by_split": {s: sum(1 for r in rows if r.split == s)
+                         for s in ("train", "validation", "test")}})
+    return 0
 
 
 def cmd_canonical_publish(args) -> int:
@@ -932,7 +948,18 @@ def build_parser() -> argparse.ArgumentParser:
     cv.set_defaults(func=cmd_canonical_verify)
     cfi = cnsub.add_parser("finalize", help="write card + manifest + READY")
     cfi.add_argument("--dataset", required=True)
+    cfi.add_argument("--state", default=None,
+                     help="private identity dir; when given, (re)writes the "
+                          "Ornix-TTS handoff manifest first (fail-closed)")
     cfi.set_defaults(func=cmd_canonical_finalize)
+    cho = cnsub.add_parser(
+        "handoff", help="write the Ornix-TTS handoff manifest.jsonl")
+    cho.add_argument("--dataset", required=True)
+    cho.add_argument("--state", required=True,
+                     help="private identity/provenance dir (source of rights)")
+    cho.add_argument("--allow-unverified-license", action="store_true",
+                     help="emit rows whose license is UNKNOWN (NOT for production)")
+    cho.set_defaults(func=cmd_canonical_handoff)
     cpub = cnsub.add_parser("publish", help="publish the dataset (dry-run default)")
     cpub.add_argument("--dataset", required=True)
     cpub.add_argument("--repo-id", required=True)

@@ -59,8 +59,11 @@ class ReleaseRow:
         """
         if self.quality_gate != "ACCEPT":
             raise ValueError(f"release row {self.audio_id} is not ACCEPT")
-        if self.sample_rate != 24000 or self.channels != 1 or self.encoding != "PCM_S16LE":
-            raise ValueError(f"release row {self.audio_id} is not canonical 24k mono PCM16")
+        if self.sample_rate <= 0 or self.channels != 1 or self.encoding != "PCM_S16LE":
+            raise ValueError(
+                f"release row {self.audio_id} is not mono PCM16 "
+                f"(sample_rate={self.sample_rate}, channels={self.channels}, "
+                f"encoding={self.encoding})")
         if self.audio.startswith("/") or ":" in self.audio.split("/")[0]:
             raise ValueError(f"release row {self.audio_id} audio path is absolute/local")
         if len(self.audio_sha256) != 64 or len(self.source_sha256) != 64:

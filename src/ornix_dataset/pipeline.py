@@ -550,7 +550,7 @@ class OrnixPipeline:
             language=src.source_language or "vi",
             speaker_id=src.source_speaker_ref or ("anon_" + short_id(src.source_sha256, length=10)),
             transcript=transcript,
-            sample_rate=24000, channels=1, encoding="PCM_S16LE",
+            sample_rate=seg_buf.sample_rate, channels=1, encoding="PCM_S16LE",
             duration_s=round(seg_buf.duration_s, 6),
             source_id=src.source_id, source_sha256=src.source_sha256, audio_sha256=audio_sha,
             segment_start_sample_source=a, segment_end_sample_source=b,

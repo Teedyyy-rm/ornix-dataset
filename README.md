@@ -2,7 +2,8 @@
 
 Fail-closed tooling that ingests speech audio from multiple sources, measures
 technical quality and noise, and produces a **redistribution-safe, ACCEPT-only**
-24 kHz mono PCM16 release for Vietnamese-first TTS. Implements the design in
+mono PCM16 release at each source's native sample rate (nothing is resampled)
+for Vietnamese-first TTS. Implements the design in
 [`docs/E2E-ORNIX-DATASET.md`](docs/E2E-ORNIX-DATASET.md).
 
 The pipeline never fabricates a PASS: a missing metric, an unavailable model, an
@@ -45,7 +46,7 @@ HF/Xet cache; `ORNIX_ENV_FILE` points at a `.env` outside the repo.
 | Phase | Concern | Module |
 |---|---|---|
 | 1 | Ingestion + immutable staging + provenance | `ingestion/` |
-| 2 | Technical WAV gate + canonical 24k renderer | `dsp/` |
+| 2 | Technical WAV gate + native-rate canonical renderer | `dsp/` |
 | 3 | VAD, windowing, event/noise detectors | `detectors/` |
 | 4 | Quality/overlap/transcript + calibration | `detectors/`, `calibration/` |
 | 5 | Deterministic policy, review, segmentation, dedup, split | `curation/` |
@@ -79,7 +80,7 @@ ornix-dataset review export --run-id run1 --workdir work
 ornix-dataset release build --run-id run1 --release-id ornix-vi-0.1 \
     --format parquet --release-target train_only --workdir work
 
-# 5. offline verification (readback 24k/mono/PCM16, sha, no secrets, manifest)
+# 5. offline verification (readback mono/PCM16 + rate khớp manifest, sha, no secrets, manifest)
 ornix-dataset release verify --release-dir work/releases/ornix-vi-0.1
 
 # 6. publish — DRY-RUN by default; prints the upload plan, touches no network
@@ -175,7 +176,7 @@ ornix-dataset canonical export --run-id run1 --workdir work \
     --dataset work/Ornix-Datasets --state work/ornix-state --allow-train-only
 
 # offline integrity: 6 fields, audio==file_name, no orphan/dangling/dup,
-# duration == real WAV, 24k/mono/PCM16, leakage-safe splits
+# duration == real WAV, mono/PCM16, leakage-safe splits
 ornix-dataset canonical verify --dataset work/Ornix-Datasets
 
 # read the exact six-field contract (raw metadata.jsonl, not HF AudioFolder)

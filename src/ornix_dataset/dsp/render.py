@@ -1,10 +1,14 @@
-"""Canonical audio renderer: 24 kHz mono signed PCM16 WAV (spec §0.1, §2).
+"""Canonical audio renderer: mono signed PCM16 WAV at the source's NATIVE rate
+(spec §0.1, §2).
 
-Never normalises loudness or denoises implicitly. Downmix policy is explicit and
-phase-cancellation is checked upstream. 16-bit conversion has a clipping guard.
-Every produced file is re-opened and proven WAV/mono/PCM16/24k before it is
-returned (post-render verification, invariant I10); a file that fails is deleted
-and the render fails closed rather than yielding a bad canonical artifact.
+Never resamples: decimating a clean high-rate source discards real content and
+upsampling cannot restore lost bandwidth, so the output keeps the measured
+source sample rate. Never normalises loudness or denoises implicitly either.
+Downmix policy is explicit and phase-cancellation is checked upstream. 16-bit
+conversion has a clipping guard. Every produced file is re-opened and proven
+WAV/mono/PCM16 at the expected rate before it is returned (post-render
+verification, invariant I10); a file that fails is deleted and the render fails
+closed rather than yielding a bad canonical artifact.
 """
 
 from __future__ import annotations
@@ -18,9 +22,7 @@ import numpy as np
 
 from ..util.hashing import sha256_file
 from .audio import AudioBuffer
-from .resample import resample_to
 
-CANONICAL_SR = 24000
 CANONICAL_CHANNELS = 1
 CANONICAL_ENCODING = "PCM_S16LE"
 
@@ -31,14 +33,12 @@ class RenderVerificationError(RuntimeError):
 
 @dataclass
 class RenderRecipe:
-    target_sample_rate: int
+    output_sample_rate: int
     channels: int
     encoding: str
     downmix_policy: str
-    resample_method: str
     clipped_samples_on_quantize: int
     source_sample_rate: int
-    upsampled_from_below_target: bool
     canonicalization_action: str = "UNKNOWN"
     source_rate_class: Optional[str] = None
     source_container: Optional[str] = None
@@ -70,19 +70,27 @@ def write_wav_pcm16(path: str, mono_int16: np.ndarray, sample_rate: int) -> None
 
 
 def verify_canonical_wav(
-    path: str, expected_n_samples: Optional[int] = None, sample_tolerance: int = 1
+    path: str,
+    expected_sample_rate: Optional[int] = None,
+    expected_n_samples: Optional[int] = None,
+    sample_tolerance: int = 1,
 ) -> Tuple[bool, List[str]]:
-    """Re-open a written WAV and prove it is canonical WAV/mono/PCM16/24k.
+    """Re-open a written WAV and prove it is WAV/mono/PCM16 at the expected rate.
 
     Trusts the file actually written, never the requested parameters. Returns
-    (ok, reasons). ``expected_n_samples`` (if given) is checked within a small
-    tolerance; NaN/Inf cannot occur in decoded int16 but the read is validated.
+    (ok, reasons). ``expected_sample_rate`` is checked when given — the release
+    path always passes the measured source rate; the canonical tree copy path
+    has no per-file rate in its six-field metadata and passes ``None``.
+    ``expected_n_samples`` (if given) is checked within a small tolerance;
+    NaN/Inf cannot occur in decoded int16 but the read is validated.
     """
     reasons: List[str] = []
     try:
         with wave.open(path, "rb") as wf:
-            if wf.getframerate() != CANONICAL_SR:
-                reasons.append(f"SR_NOT_24K:{wf.getframerate()}")
+            if expected_sample_rate is not None and \
+                    wf.getframerate() != expected_sample_rate:
+                reasons.append(
+                    f"SR_MISMATCH:{wf.getframerate()}!={expected_sample_rate}")
             if wf.getnchannels() != CANONICAL_CHANNELS:
                 reasons.append(f"NOT_MONO:{wf.getnchannels()}")
             if wf.getsampwidth() != 2:
@@ -102,35 +110,30 @@ def verify_canonical_wav(
     return (not reasons), reasons
 
 
-def _action_for(src_sr: int) -> str:
-    if src_sr == CANONICAL_SR:
-        return "IDENTITY"
-    if src_sr > CANONICAL_SR:
-        return "DOWNSAMPLE"
-    return "UPSAMPLE_NEAR_TARGET"
-
-
 def render_canonical_wav(
     buf: AudioBuffer, out_path: str, downmix_policy: str = "mean", admission: Any = None
 ) -> Tuple[str, RenderRecipe]:
-    """Render ``buf`` to a canonical 24k mono PCM16 WAV. Returns (audio_sha256, recipe).
+    """Render ``buf`` to a mono PCM16 WAV at its native rate. Returns (sha256, recipe).
 
-    decode-once -> explicit mono downmix -> band-limited resample-once -> PCM16 ->
-    WAV -> post-render verification. Fails closed if the band-limited resampler is
-    unavailable or if the written file does not verify as WAV/mono/PCM16/24k.
+    decode-once -> explicit mono downmix -> PCM16 -> WAV -> post-render
+    verification. The canonicalization action comes from the measured admission
+    report and is never guessed: a missing admission is a programming error and
+    fails closed. The written file must verify as WAV/mono/PCM16 at the measured
+    source rate, or it is deleted and the render fails closed.
     """
+    if admission is None:
+        raise ValueError(
+            "admission report required: canonicalization action must come from "
+            "measured admission, never guessed")
     src_sr = buf.sample_rate
+    if not src_sr or int(src_sr) <= 0:
+        raise ValueError(f"invalid source sample rate {src_sr!r}; refusing to render")
     mono = buf.to_mono(downmix_policy)
-    resampled, method = resample_to(mono, CANONICAL_SR)
-    if method == "linear-degraded":
-        raise RuntimeError(
-            "band-limited resampler unavailable (install scipy); refusing to render "
-            "a degraded canonical clip (fail-closed)"
-        )
-    pcm16, clipped = _float_to_pcm16(resampled.samples)
-    write_wav_pcm16(out_path, pcm16, CANONICAL_SR)
+    pcm16, clipped = _float_to_pcm16(mono.samples)
+    write_wav_pcm16(out_path, pcm16, src_sr)
 
-    ok, verify_reasons = verify_canonical_wav(out_path, expected_n_samples=pcm16.shape[0])
+    ok, verify_reasons = verify_canonical_wav(
+        out_path, expected_sample_rate=src_sr, expected_n_samples=pcm16.shape[0])
     if not ok:
         try:  # quarantine only the generated invalid artifact; never the source
             os.remove(out_path)
@@ -140,16 +143,13 @@ def render_canonical_wav(
             f"canonical post-render verification failed: {verify_reasons}")
 
     recipe = RenderRecipe(
-        target_sample_rate=CANONICAL_SR,
+        output_sample_rate=src_sr,
         channels=CANONICAL_CHANNELS,
         encoding=CANONICAL_ENCODING,
         downmix_policy=downmix_policy if buf.channels > 1 else "none",
-        resample_method=method,
         clipped_samples_on_quantize=clipped,
         source_sample_rate=src_sr,
-        upsampled_from_below_target=src_sr < CANONICAL_SR,
-        canonicalization_action=(getattr(admission, "canonicalization_action", None)
-                                 or _action_for(src_sr)),
+        canonicalization_action=admission.canonicalization_action,
         source_rate_class=getattr(admission, "source_rate_class", None),
         source_container=getattr(admission, "source_container", None),
         source_codec=getattr(admission, "source_codec", None),

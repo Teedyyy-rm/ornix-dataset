@@ -34,40 +34,41 @@ def test_t1_wav_24k_identity(tmp_path):
     assert adm.source_sample_rate == 24000
 
 
-def test_t2_48k_downsample(tmp_path):
+def test_t2_48k_kept_native(tmp_path):
     adm, _ = _assess(tmp_path, "n48.wav", 48000)
     assert adm.admitted
-    assert adm.canonicalization_action == CanonicalizationAction.DOWNSAMPLE.value
-    # target-aware bandwidth: a clean high-rate source is NOT flagged low-bandwidth
+    assert adm.source_rate_class == SourceRateClass.NATIVE_OR_HIGHER.value
+    assert adm.canonicalization_action == CanonicalizationAction.IDENTITY.value
+    # capped bandwidth reference: a clean high-rate source is NOT flagged low-bandwidth
     assert not adm.low_bandwidth_suspected
 
 
-def test_t3_44100_downsample(tmp_path):
+def test_t3_44100_kept_native(tmp_path):
     adm, _ = _assess(tmp_path, "n441.wav", 44100)
     assert adm.admitted
-    assert adm.canonicalization_action == CanonicalizationAction.DOWNSAMPLE.value
+    assert adm.canonicalization_action == CanonicalizationAction.IDENTITY.value
 
 
-def test_t4_32k_downsample(tmp_path):
+def test_t4_32k_kept_native(tmp_path):
     adm, _ = _assess(tmp_path, "n32.wav", 32000)
     assert adm.admitted
-    assert adm.canonicalization_action == CanonicalizationAction.DOWNSAMPLE.value
+    assert adm.canonicalization_action == CanonicalizationAction.IDENTITY.value
 
 
-def test_t6_22050_conditional_upsample(tmp_path):
+def test_t6_22050_below_min_native_rejected(tmp_path):
     adm, _ = _assess(tmp_path, "n2205.wav", 22050)
-    assert adm.admitted
-    assert adm.source_rate_class == SourceRateClass.NEAR_TARGET_UPSAMPLE.value
-    assert adm.canonicalization_action == CanonicalizationAction.UPSAMPLE_NEAR_TARGET.value
-    assert adm.source_sample_rate == 22050  # provenance keeps the true source rate
-    assert any("NOT_NATIVE_24K" in r for r in adm.reason_codes)
-
-
-def test_t6_22050_rejected_when_upsample_disallowed(tmp_path):
-    cfg = AdmissionConfig(allow_near_target_upsample=False)
-    adm, _ = _assess(tmp_path, "n2205b.wav", 22050, cfg=cfg)
     assert not adm.admitted
-    assert any("NEAR_TARGET_UPSAMPLE_NOT_ALLOWED" in r for r in adm.reason_codes)
+    assert adm.source_rate_class == SourceRateClass.BELOW_MIN_NATIVE.value
+    assert adm.canonicalization_action == CanonicalizationAction.REJECT_BELOW_MIN_NATIVE.value
+    assert adm.source_sample_rate == 22050  # provenance keeps the true source rate
+    assert any("BELOW_MIN_NATIVE" in r for r in adm.reason_codes)
+
+
+def test_t6_22050_admitted_when_policy_lowers_min(tmp_path):
+    cfg = AdmissionConfig(native_min_sample_rate=22050)
+    adm, _ = _assess(tmp_path, "n2205b.wav", 22050, cfg=cfg)
+    assert adm.admitted
+    assert adm.canonicalization_action == CanonicalizationAction.IDENTITY.value
 
 
 def test_t7_16k_rejected_low_bandwidth(tmp_path):

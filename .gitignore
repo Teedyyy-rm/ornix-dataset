@@ -36,3 +36,4 @@ htmlcov/
 
 # Agent/editor scratch
 .zcode/
+.commandcode/

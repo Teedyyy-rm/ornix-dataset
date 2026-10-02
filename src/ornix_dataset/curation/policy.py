@@ -107,8 +107,8 @@ class PolicyEngine:
         return PASS
 
     def _source_bandwidth(self, ev, reasons) -> str:
-        # A source whose measured bandwidth is narrow relative to the 24 kHz
-        # target (likely an upsampled low-bandwidth source) must not silently
+        # A source whose measured bandwidth is narrow relative to the reference
+        # cap (likely an upsampled low-bandwidth source) must not silently
         # enter strict clean HQ. There is no validated hard bandwidth threshold,
         # so a suspected case is routed to REVIEW (UNKNOWN), never a fabricated
         # PASS or REJECT (spec §Effective bandwidth logic).

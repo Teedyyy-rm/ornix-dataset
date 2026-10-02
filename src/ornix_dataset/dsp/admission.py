@@ -1,16 +1,18 @@
 """Source Audio Admission — Level 1 of the clean-HQ contract (spec §Repair).
 
 Answers, from *measured* evidence (never the file extension), whether a source is
-eligible for the Ornix clean 24 kHz release and, if so, what canonicalization
+eligible for the Ornix native-rate release and, if so, what canonicalization
 action it warrants:
 
-    NATIVE_OR_HIGHER      -> IDENTITY (== 24k) or DOWNSAMPLE (> 24k)
-    NEAR_TARGET_UPSAMPLE  -> UPSAMPLE_NEAR_TARGET (only if policy allows)
+    NATIVE_OR_HIGHER      -> IDENTITY (kept at the source rate, never resampled)
+    BELOW_MIN_NATIVE      -> REJECT_BELOW_MIN_NATIVE (nothing is ever upsampled)
     LOW_BANDWIDTH_SOURCE  -> REJECT_LOW_BANDWIDTH (strict HQ default)
     NARROWBAND_SOURCE     -> REJECT_NARROWBAND (strict HQ default)
 
-Upsampling a low-rate/narrowband source cannot restore lost bandwidth: a file is
-never admitted merely because its output would say 24,000 Hz (invariants I1/I2/I9).
+Upsampling a low-rate/narrowband source cannot restore lost bandwidth, and
+decimating a clean high-rate source discards real content: the release keeps the
+native rate (see docs/PLAN-NATIVE-SAMPLE-RATE.md). A file is never admitted
+merely because an output *would* say a canonical number (invariants I1/I2/I9).
 Codec is classified separately from container: extension != codec, WAV != lossless
 PCM, and lossy->WAV does not restore information (invariants I3/I4/I5).
 """
@@ -62,11 +64,9 @@ class AdmissionConfig:
     versioned config change — do not scatter magic constants in code.
     """
 
-    canonical_sample_rate: int = 24000
     native_min_sample_rate: int = 24000
     conditional_min_sample_rate: int = 22050
     low_bandwidth_min_sample_rate: int = 16000
-    allow_near_target_upsample: bool = True
     reject_low_bandwidth_from_clean_hq: bool = True
     reject_narrowband_from_clean_hq: bool = True
 
@@ -93,7 +93,7 @@ def _rate_class(sr: int, cfg: AdmissionConfig) -> SourceRateClass:
     if sr >= cfg.native_min_sample_rate:
         return SourceRateClass.NATIVE_OR_HIGHER
     if sr >= cfg.conditional_min_sample_rate:
-        return SourceRateClass.NEAR_TARGET_UPSAMPLE
+        return SourceRateClass.BELOW_MIN_NATIVE
     if sr >= cfg.low_bandwidth_min_sample_rate:
         return SourceRateClass.LOW_BANDWIDTH_SOURCE
     return SourceRateClass.NARROWBAND_SOURCE
@@ -137,18 +137,14 @@ def assess_source(report: TechnicalReport,
             f"SUSPECTED_UPSAMPLED_SOURCE:eff_bw={report.effective_bandwidth_hz}")
 
     if rate_class == SourceRateClass.NATIVE_OR_HIGHER:
-        action = (CanonicalizationAction.IDENTITY if sr == cfg.canonical_sample_rate
-                  else CanonicalizationAction.DOWNSAMPLE)
+        # kept at the measured native rate; canonicalization never resamples
+        action = CanonicalizationAction.IDENTITY
         admitted = True
-    elif rate_class == SourceRateClass.NEAR_TARGET_UPSAMPLE:
-        if cfg.allow_near_target_upsample:
-            action = CanonicalizationAction.UPSAMPLE_NEAR_TARGET
-            admitted = True
-            reasons.append("CONDITIONAL_UPSAMPLE_NOT_NATIVE_24K")
-        else:
-            action = CanonicalizationAction.UPSAMPLE_NEAR_TARGET
-            admitted = False
-            reasons.append("NEAR_TARGET_UPSAMPLE_NOT_ALLOWED")
+    elif rate_class == SourceRateClass.BELOW_MIN_NATIVE:
+        action = CanonicalizationAction.REJECT_BELOW_MIN_NATIVE
+        admitted = False
+        reasons.append(
+            f"BELOW_MIN_NATIVE:sr={sr}<min={cfg.native_min_sample_rate}")
     elif rate_class == SourceRateClass.LOW_BANDWIDTH_SOURCE:
         action = CanonicalizationAction.REJECT_LOW_BANDWIDTH
         admitted = not cfg.reject_low_bandwidth_from_clean_hq

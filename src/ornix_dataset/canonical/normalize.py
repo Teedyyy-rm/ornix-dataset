@@ -3,7 +3,8 @@
 Only *verified* records are accepted. A sample enters the public dataset when
 all of the following hold, otherwise it is excluded (never silently accepted):
 
-- the input WAV is a canonical 24 kHz mono PCM16 file that re-verifies;
+- the input WAV is a canonical mono PCM16 file at the native source rate that
+  re-verifies;
 - the transcript is present **and** flagged verified;
 - the language is verified (no blind default);
 - the rights are redistributable (for the public destination);
@@ -25,6 +26,7 @@ from typing import Any, Callable, Dict, List, Optional
 from ..dsp.render import verify_canonical_wav
 from ..util.hashing import sha256_file
 from . import card, layout
+from .handoff import HandoffError, write_handoff_manifest
 from .identity import CanonicalState, internal_sample_key, open_state
 from .schema import CanonicalRow, SchemaError, audio_path_for, normalize_language
 
@@ -202,6 +204,19 @@ def normalize_samples(samples: List[SampleInput], dataset_dir: str,
     rights = {"licenses": sorted(l for l in licenses if l),
               "rights_status": sorted(statuses),
               "require_redistributable": require_redistributable}
+    # Handoff artifact (Ornix-TTS contract). Generated BEFORE the checksum
+    # manifest so MANIFEST.sha256 covers it when it exists.
+    # Non-fatal HERE on purpose: a TRAIN_ONLY tree or an operator-declared
+    # license legitimately has no production handoff yet. The fail-closed gate
+    # lives at the publication boundary (canonical.finalize_dataset / the
+    # `canonical handoff` CLI), which refuses to finalize without it.
+    handoff: Dict[str, Any] = {"written": False, "reason": "NO_EXPORTABLE_ROW"}
+    if stats["n_rows"] > 0:
+        try:
+            path, handoff_rows = write_handoff_manifest(dataset_dir, state_dir)
+            handoff = {"written": True, "path": path, "n_rows": len(handoff_rows)}
+        except HandoffError as e:
+            handoff = {"written": False, "reason": str(e)}
     if stats["n_rows"] > 0:
         card.write_card(dataset_dir, stats, rights, changelog)
         layout.write_manifest_sha(dataset_dir)
@@ -210,4 +225,4 @@ def normalize_samples(samples: List[SampleInput], dataset_dir: str,
             "n_rows": stats["n_rows"], "by_split": stats["by_split"],
             "n_blocked": len(blocked), "blocked": blocked,
             "n_reused_files": n_reused_files, "merged": merged_summary,
-            "stats": stats}
+            "stats": stats, "handoff": handoff}
