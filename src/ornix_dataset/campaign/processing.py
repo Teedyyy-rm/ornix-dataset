@@ -326,11 +326,14 @@ def gate_receipt_path(store: Any, job_id: str) -> str:
 
 def gate_batch_release(store: Any, job_id: str, batch_id: str,
                        ratios: tuple = (0.8, 0.1, 0.1)) -> Dict[str, Any]:
-    """Promote BATCH_PROCESSED → RELEASE_READY iff job-global evidence is whole.
+    """Promote BATCH_PROCESSED → RELEASE_READY for THIS batch, fail-closed.
 
-    Refuses (fail-closed) when any sibling batch lacks accepted rows, when the
-    split assignment leaks across speaker groups, and reports exact content
-    duplicates without dropping them.
+    Split leakage and duplicate reporting are still computed over the whole job
+    (all accepted rows that exist so far), but a batch no longer waits for its
+    siblings: each batch is an independent release unit, which is what the
+    100-clip sub-batching pipeline needs to publish incrementally. A sibling
+    still mid-QC simply is not counted yet; the assignment only spans rows that
+    actually exist.
     """
     job = store.load_job(job_id)
     batch = store.load_batch(batch_id)
@@ -340,21 +343,22 @@ def gate_batch_release(store: Any, job_id: str, batch_id: str,
         return {"ok": False, "reason": f"batch-status-{batch.status}"}
 
     per_batch: Dict[str, List[Dict[str, Any]]] = {}
-    missing: List[str] = []
+    n_pending_siblings = 0
     for bid in job.batch_ids:
         b = store.load_batch(bid)
         acc_file = os.path.join(
             qc_paths(store, job.job_id, b.batch_id).root, "BATCH_ACCEPTED.jsonl")
-        rows = load_jsonl(acc_file)
+        rows = load_jsonl(acc_file) if os.path.exists(acc_file) else []
         if b.status not in (BatchStatus.BATCH_PROCESSED.value,
                             BatchStatus.RELEASE_READY.value,
-                            BatchStatus.DONE.value) or not os.path.exists(acc_file):
-            missing.append(bid)
-        per_batch[bid] = rows
-    if missing:
-        return {"ok": False, "reason": "global-evidence-incomplete",
-                "missing_batches": missing,
-                "note": "release-ready needs every batch processed first"}
+                            BatchStatus.DONE.value):
+            n_pending_siblings += 1
+        if rows:
+            per_batch[bid] = rows
+    this_file = os.path.join(
+        qc_paths(store, job.job_id, batch.batch_id).root, "BATCH_ACCEPTED.jsonl")
+    if not os.path.exists(this_file):
+        return {"ok": False, "reason": "no-accepted-rows"}
 
     group_keys: Dict[str, str] = {}
     sha_by_id: Dict[str, str] = {}
@@ -373,6 +377,8 @@ def gate_batch_release(store: Any, job_id: str, batch_id: str,
     receipt = {"job_id": job.job_id, "repo_id": job.repo_id,
                "pinned_sha": job.pinned_sha,
                "n_accepted": len(group_keys),
+               "n_accepted_this_batch": len(load_jsonl(this_file)),
+               "n_pending_sibling_batches": n_pending_siblings,
                "assignment": assignment, "duplicates": duplicates,
                "gated_batch": batch.batch_id, "gated_utc": utc_now_iso()}
     os.makedirs(os.path.dirname(gate_receipt_path(store, job.job_id)),
@@ -387,5 +393,7 @@ def gate_batch_release(store: Any, job_id: str, batch_id: str,
                                          store, job.job_id)}}
     store.save_batch(batch)
     return {"ok": True, "batch": batch.batch_id, "n_accepted": len(group_keys),
+            "n_accepted_this_batch": receipt["n_accepted_this_batch"],
+            "n_pending_sibling_batches": n_pending_siblings,
             "duplicates": duplicates,
             "receipt": gate_receipt_path(store, job.job_id)}

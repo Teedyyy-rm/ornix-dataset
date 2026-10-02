@@ -127,21 +127,34 @@ def _two_batch_job(tmp_path, payload_size=1024):
     return store, jid, batches
 
 
-def test_gate_refuses_until_global_evidence_whole(tmp_path):
+def test_gate_permits_batch_independently(tmp_path):
+    # Each batch is its own release unit: a processed batch may be gated and
+    # published without waiting for its siblings (needed for the fan-out
+    # publish flow). A sibling still mid-QC is reported, never required.
     store, jid, batches = _two_batch_job(tmp_path)
     run_qc_batch(store, jid, batches[0].batch_id, FakeAnalyzer())
     rep = gate_batch_release(store, jid, batches[0].batch_id)
-    assert rep["ok"] is False and rep["reason"] == "global-evidence-incomplete"
-    assert rep["missing_batches"] == [batches[1].batch_id]
-    assert store.load_batch(batches[0].batch_id).status == "BATCH_PROCESSED"
-    # second batch processed => gate passes for both
-    run_qc_batch(store, jid, batches[1].batch_id, FakeAnalyzer())
-    for b in batches:
-        g = gate_batch_release(store, jid, b.batch_id)
-        assert g["ok"] is True, g
-        assert store.load_batch(b.batch_id).status == "RELEASE_READY"
+    assert rep["ok"] is True, rep
+    assert store.load_batch(batches[0].batch_id).status == "RELEASE_READY"
+    assert rep["n_pending_sibling_batches"] == 1
     assert os.path.exists(os.path.join(store.root, "releases",
                                        f"{jid}.GATE.json"))
+    # the sibling still gates on its own once processed
+    run_qc_batch(store, jid, batches[1].batch_id, FakeAnalyzer())
+    g = gate_batch_release(store, jid, batches[1].batch_id)
+    assert g["ok"] is True, g
+    assert store.load_batch(batches[1].batch_id).status == "RELEASE_READY"
+
+
+def test_gate_refuses_batch_without_accepted_rows(tmp_path):
+    # fail-closed: no BATCH_ACCEPTED snapshot => nothing to release
+    store, jid, batches = _two_batch_job(tmp_path)
+    run_qc_batch(store, jid, batches[0].batch_id, FakeAnalyzer())
+    b1 = store.load_batch(batches[1].batch_id)
+    b1.status = "BATCH_PROCESSED"
+    store.save_batch(b1)
+    rep = gate_batch_release(store, jid, batches[1].batch_id)
+    assert rep["ok"] is False and rep["reason"] == "no-accepted-rows"
 
 
 def test_gate_reports_duplicates_without_dropping(tmp_path):

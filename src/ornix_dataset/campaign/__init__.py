@@ -23,6 +23,12 @@ from .downloading import (
     read_manifest,
     run_batch,
 )
+from .fanout import (
+    DEFAULT_CHUNK,
+    chunk_accepted,
+    fanout_releases,
+    write_approvals,
+)
 from .parquet import expand_batch_parquet, is_parquet_path
 from .processing import (
     gate_batch_release,
@@ -100,12 +106,15 @@ __all__ = [
     "canonical_repo_id",
     "check_destination",
     "cleanup_batch",
+    "DEFAULT_CHUNK",
+    "chunk_accepted",
     "default_resolver",
     "downloaded_files",
     "dry_run_plan",
     "eligibility",
     "expand_batch_parquet",
     "expected_upload_bytes",
+    "fanout_releases",
     "fetch_job_inventory",
     "gate_batch_release",
     "gate_receipt_path",
@@ -140,4 +149,5 @@ __all__ = [
     "run_qc_batch",
     "staging_revision_for",
     "try_admit",
+    "write_approvals",
 ]

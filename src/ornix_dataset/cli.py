@@ -644,6 +644,112 @@ def cmd_env_status(args) -> int:
     return 0
 
 
+def cmd_campaign_fanout(args) -> int:
+    """Split a processed batch's accepted rows into N-clip releases."""
+    from .campaign import CampaignStore
+    from .campaign.fanout import fanout_releases
+    from .campaign.processing import qc_paths
+
+    store = CampaignStore(args.root)
+    try:
+        job = store.load_job(args.job)
+        store.load_batch(args.batch)
+    except FileNotFoundError as e:
+        _print({"error": f"unknown campaign/job/batch: {e}"})
+        return 2
+    canonical = qc_paths(store, job.job_id, args.batch).canonical_dir
+    rep = fanout_releases(
+        store, args.job, args.batch, chunk_size=args.chunk_size,
+        canonical_dir=canonical,
+        release_target=args.release_target,
+        export_format=args.format)
+    if args.out:
+        from .util.io import write_json
+
+        write_json(args.out, rep)
+    _print({k: v for k, v in rep.items() if k != "releases"})
+    for r in rep["releases"]:
+        _print({"release_id": r["release_id"], "n_rows": r["n_rows"],
+                "ready": r["ready"], "digest": r.get("digest"),
+                "blockers": r["blockers"]})
+    return 0 if rep["ok"] else 3
+
+
+def cmd_campaign_fanout_publish(args) -> int:
+    """Mint an approval per ready chunk and publish each one to the Hub."""
+    import datetime
+
+    from .campaign import CampaignStore
+    from .campaign.fanout import fanout_releases, write_approvals
+    from .campaign.processing import qc_paths
+    from .campaign.publishing import publish_release
+    from .publishing.hf import staging_revision_for
+    from .campaign.publishing import path_prefix_for
+
+    store = CampaignStore(args.root)
+    campaign = store.load_campaign()
+    try:
+        job = store.load_job(args.job)
+        store.load_batch(args.batch)
+    except FileNotFoundError as e:
+        _print({"error": f"unknown campaign/job/batch: {e}"})
+        return 2
+    if not args.repo:
+        _print({"error": "--repo is required"})
+        return 2
+    canonical = qc_paths(store, job.job_id, args.batch).canonical_dir
+    rep = fanout_releases(
+        store, args.job, args.batch, chunk_size=args.chunk_size,
+        canonical_dir=canonical,
+        release_target=args.release_target,
+        export_format=args.format)
+    if not rep["ok"]:
+        _print({"error": "no ready chunk to publish", **{
+            k: v for k, v in rep.items() if k != "releases"}})
+        return 3
+    approval_dir = args.approval_dir or os.path.join(
+        rep["out_root"], "_approvals")
+    expires = args.expires_utc or (
+        datetime.datetime.now(datetime.timezone.utc)
+        + datetime.timedelta(hours=args.ttl_hours)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    approvals = write_approvals(
+        rep["releases"], repo_id=args.repo,
+        revision_of=lambda rid: staging_revision_for(rid),
+        operator_id=args.operator_id, policy_version=args.policy_version,
+        expires_utc=expires, max_bytes=args.max_bytes,
+        approval_dir=approval_dir)
+    by_id = {a["release_id"]: a for a in approvals}
+    targets = [r for r in rep["releases"]
+               if r["release_id"] in by_id and (not args.max_chunks
+                                                 or r["index"] < args.max_chunks)]
+    if args.dry_run:
+        _print({"dry_run": True, "chunk_size": rep["chunk_size"],
+                "n_chunks": rep["n_chunks"], "n_ready": rep["n_ready"],
+                "n_to_publish": len(targets), "repo": args.repo,
+                "approval_dir": approval_dir, "expires_utc": expires,
+                "note": "approvals minted locally; nothing uploaded"})
+        for r in targets:
+            _print({"release_id": r["release_id"], "n_rows": r["n_rows"],
+                    "digest": r.get("digest")})
+        return 0
+    published, failed = [], []
+    for rec in targets:
+        ap = by_id.get(rec["release_id"])
+        out = publish_release(store, rec["release_id"], args.repo, ap["approval"],
+                             full_hash=True, destination=campaign.destination)
+        row = {"release_id": rec["release_id"], "n_rows": rec["n_rows"],
+               "ok": bool(out.get("ok")), "status": out.get("status"),
+               "reasons": out.get("reasons")}
+        (published if row["ok"] else failed).append(row)
+    _print({"chunk_size": rep["chunk_size"], "n_chunks": rep["n_chunks"],
+            "n_published": len(published), "n_failed": len(failed),
+            "approval_dir": approval_dir})
+    for row in published + failed:
+        _print(row)
+    return 0 if published and not failed else 3
+
+
 def cmd_canonical_export(args) -> int:
     from .canonical import export_run
 
@@ -918,6 +1024,45 @@ def build_parser() -> argparse.ArgumentParser:
     crep.add_argument("--dry-run", action="store_true",
                       help="read-only next-action preview; mutates nothing")
     crep.set_defaults(func=cmd_campaign_report)
+
+    cfo = cpsub.add_parser(
+        "fanout", help="split a processed batch's accepted rows into N-clip releases")
+    cfo.add_argument("--root", required=True)
+    cfo.add_argument("--job", required=True)
+    cfo.add_argument("--batch", required=True)
+    cfo.add_argument("--chunk-size", type=int, default=100,
+                     help="accepted rows per release (default 100)")
+    cfo.add_argument("--release-target", default="train_only")
+    cfo.add_argument("--format", default="none", choices=("none", "parquet", "webdataset"))
+    cfo.add_argument("--out", default=None)
+    wd(cfo)
+    cfo.set_defaults(func=cmd_campaign_fanout)
+
+    cfop = cpsub.add_parser(
+        "fanout-publish",
+        help="fan out then mint one approval per chunk and publish each one")
+    cfop.add_argument("--root", required=True)
+    cfop.add_argument("--job", required=True)
+    cfop.add_argument("--batch", required=True)
+    cfop.add_argument("--chunk-size", type=int, default=100)
+    cfop.add_argument("--repo", required=True)
+    cfop.add_argument("--release-target", default="train_only")
+    cfop.add_argument("--format", default="none",
+                      choices=("none", "parquet", "webdataset"))
+    cfop.add_argument("--approval-dir", default=None)
+    cfop.add_argument("--operator-id", default="operator")
+    cfop.add_argument("--policy-version", default="ornix-qc-pilot-v1")
+    cfop.add_argument("--expires-utc", default=None,
+                      help="approval expiry (default: now + --ttl-hours)")
+    cfop.add_argument("--ttl-hours", type=float, default=24.0)
+    cfop.add_argument("--max-bytes", type=int, default=8 * 1024**3,
+                      help="per-release byte quota in the receipt")
+    cfop.add_argument("--max-chunks", type=int, default=0,
+                      help="publish at most N chunks (0 = all)")
+    cfop.add_argument("--dry-run", action="store_true", default=True)
+    cfop.add_argument("--execute", dest="dry_run", action="store_false")
+    wd(cfop)
+    cfop.set_defaults(func=cmd_campaign_fanout_publish)
 
     cn = sub.add_parser("canonical", help="unified Ornix Dataset normalization")
     cnsub = cn.add_subparsers(dest="sub", required=True)
