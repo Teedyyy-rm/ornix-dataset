@@ -115,6 +115,21 @@ def fanout_releases(store: Any, job_id: str, batch_id: str, *,
             "analyzer_version": __version__}
 
 
+def _campaign_id(store: Any) -> Optional[str]:
+    """Campaign id lives on the store's campaign.json, not on DatasetJob."""
+    try:
+        return store.load_campaign().campaign_id
+    except Exception:
+        return None
+
+
+def _destination_repo(store: Any) -> Optional[str]:
+    try:
+        return (store.load_campaign().destination or {}).get("repo_id")
+    except Exception:
+        return None
+
+
 def _write_release_record(store: Any, job: Any, batch: Any,
                           rec: Dict[str, Any], *, campaign_id: Optional[str],
                           revision: str, path_prefix: str,
@@ -129,11 +144,11 @@ def _write_release_record(store: Any, job: Any, batch: Any,
 
     payload = {
         "release_id": rec["release_id"],
-        "campaign_id": campaign_id or job.campaign_id,
+        "campaign_id": campaign_id or _campaign_id(store),
         "job_id": job.job_id,
         "batch_id": batch.batch_id,
         "fanout_index": rec["index"],
-        "repo_target": (getattr(store, "_destination_repo", None)),
+        "repo_target": _destination_repo(store),
         "revision": revision,
         "path_prefix": path_prefix,
         "ready": bool(rec["ready"]),

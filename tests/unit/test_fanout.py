@@ -78,3 +78,30 @@ def test_approvals_only_for_ready_and_bound_to_digest(tmp_path):
     assert rec["license_ack"] is True
     # a blocked chunk never gets an approval file
     assert not os.path.exists(str(tmp_path / "r1.approval.yaml"))
+
+
+def test_campaign_helpers_read_the_store_not_the_job(tmp_path):
+    # DatasetJob has no campaign_id; those live on campaign.json. A fan-out
+    # chunk must still resolve both or the release record is unusable.
+    from ornix_dataset.campaign.fanout import _campaign_id, _destination_repo
+
+    class _Store:
+        def load_campaign(self):
+            class C:
+                campaign_id = "camp-1"
+                destination = {"repo_id": "org/ds"}
+            return C()
+
+    assert _campaign_id(_Store()) == "camp-1"
+    assert _destination_repo(_Store()) == "org/ds"
+
+
+def test_campaign_helpers_tolerate_missing_campaign(tmp_path):
+    from ornix_dataset.campaign.fanout import _campaign_id, _destination_repo
+
+    class _Broken:
+        def load_campaign(self):
+            raise FileNotFoundError("no campaign")
+
+    assert _campaign_id(_Broken()) is None
+    assert _destination_repo(_Broken()) is None
