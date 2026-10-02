@@ -144,8 +144,14 @@ def publish_release(store: Any, release_id: str, repo_id: str,
                     approval_path: str, full_hash: bool = False,
                     upload_retries: int = 3,
                     destination: Optional[Dict[str, Any]] = None,
-                    api: Any = None) -> Dict[str, Any]:
+                    api: Any = None,
+                    staging_revision: Optional[str] = None) -> Dict[str, Any]:
     """Upload a prepared release; write the REMOTE_VERIFIED receipt on success.
+
+    ``staging_revision`` overrides the branch recorded at build time, which is
+    how a release prepared for a per-chunk staging branch can instead be
+    committed straight to ``main``. The approval receipt still pins that exact
+    revision, so a mismatch still fails closed.
 
     If ``destination`` declares ``max_bytes``, the destination's real size is
     measured first and the upload is refused when it would exceed the quota
@@ -172,7 +178,8 @@ def publish_release(store: Any, release_id: str, repo_id: str,
     pub = StagedPublisher()
     res = pub.publish(release_dir, repo_id, dry_run=False,
                       approval_path=approval_path,
-                      staging_revision=record["revision"],
+                      staging_revision=(staging_revision
+                                       or record["revision"]),
                       path_in_repo=record["path_prefix"],
                       upload_retries=upload_retries,
                       full_hash=full_hash)

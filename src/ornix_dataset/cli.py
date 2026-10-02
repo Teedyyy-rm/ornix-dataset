@@ -707,13 +707,21 @@ def cmd_campaign_fanout_publish(args) -> int:
         return 3
     approval_dir = args.approval_dir or os.path.join(
         rep["out_root"], "_approvals")
+    # Publish target: `main` writes straight to the dataset's default branch.
+    # The default keeps the per-chunk staging branch, which uploads BESIDE main
+    # instead of merging into it (that is why nothing appears on the dataset page).
+    if args.target_revision == "main":
+        def revision_of(rid: str) -> str:
+            return "main"
+    else:
+        def revision_of(rid: str) -> str:
+            return staging_revision_for(rid)
     expires = args.expires_utc or (
         datetime.datetime.now(datetime.timezone.utc)
         + datetime.timedelta(hours=args.ttl_hours)
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
     approvals = write_approvals(
-        rep["releases"], repo_id=args.repo,
-        revision_of=lambda rid: staging_revision_for(rid),
+        rep["releases"], repo_id=args.repo, revision_of=revision_of,
         operator_id=args.operator_id, policy_version=args.policy_version,
         expires_utc=expires, max_bytes=args.max_bytes,
         approval_dir=approval_dir)
@@ -725,6 +733,7 @@ def cmd_campaign_fanout_publish(args) -> int:
         _print({"dry_run": True, "chunk_size": rep["chunk_size"],
                 "n_chunks": rep["n_chunks"], "n_ready": rep["n_ready"],
                 "n_to_publish": len(targets), "repo": args.repo,
+                "target_revision": revision_of("sample"),
                 "approval_dir": approval_dir, "expires_utc": expires,
                 "note": "approvals minted locally; nothing uploaded"})
         for r in targets:
@@ -735,7 +744,8 @@ def cmd_campaign_fanout_publish(args) -> int:
     for rec in targets:
         ap = by_id.get(rec["release_id"])
         out = publish_release(store, rec["release_id"], args.repo, ap["approval"],
-                             full_hash=True, destination=campaign.destination)
+                             full_hash=True, destination=campaign.destination,
+                             staging_revision=revision_of(rec["release_id"]))
         row = {"release_id": rec["release_id"], "n_rows": rec["n_rows"],
                "ok": bool(out.get("ok")), "status": out.get("status"),
                "reasons": out.get("reasons")}
@@ -1057,6 +1067,10 @@ def build_parser() -> argparse.ArgumentParser:
                       help="per-release byte quota in the receipt")
     cfop.add_argument("--max-chunks", type=int, default=0,
                       help="publish at most N chunks (0 = all)")
+    cfop.add_argument("--target-revision", default="main",
+                      help="branch to commit to: 'main' (default) publishes "
+                           "straight to the dataset's default branch; "
+                           "'staging' keeps one branch per chunk")
     cfop.add_argument("--dry-run", action="store_true", default=True)
     cfop.add_argument("--execute", dest="dry_run", action="store_false")
     wd(cfop)
