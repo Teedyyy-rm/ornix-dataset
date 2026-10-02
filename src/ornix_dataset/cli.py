@@ -744,7 +744,8 @@ def cmd_campaign_fanout_publish(args) -> int:
     for rec in targets:
         ap = by_id.get(rec["release_id"])
         out = publish_release(store, rec["release_id"], args.repo, ap["approval"],
-                             full_hash=True, destination=campaign.destination,
+                             full_hash=args.full_hash,
+                             destination=campaign.destination,
                              staging_revision=revision_of(rec["release_id"]))
         row = {"release_id": rec["release_id"], "n_rows": rec["n_rows"],
                "ok": bool(out.get("ok")), "status": out.get("status"),
@@ -1071,6 +1072,14 @@ def build_parser() -> argparse.ArgumentParser:
                       help="branch to commit to: 'main' (default) publishes "
                            "straight to the dataset's default branch; "
                            "'staging' keeps one branch per chunk")
+    cfop.add_argument("--full-hash", action="store_true", default=True,
+                      help="re-download and hash EVERY file for verification "
+                           "(default: on)")
+    cfop.add_argument("--no-full-hash", dest="full_hash", action="store_false",
+                      help="verify a deterministic sample of files instead; the "
+                           "exact-set comparison still runs, so extra/stale "
+                           "remote files are still a failure — only the "
+                           "per-file hash check is sampled. Much faster.")
     cfop.add_argument("--dry-run", action="store_true", default=True)
     cfop.add_argument("--execute", dest="dry_run", action="store_false")
     wd(cfop)
