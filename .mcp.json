@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "colab-mcp": {
+      "transport": "stdio",
+      "enabled": true,
+      "command": "uvx",
+      "args": ["git+https://github.com/googlecolab/colab-mcp"]
+    }
+  }
+}
