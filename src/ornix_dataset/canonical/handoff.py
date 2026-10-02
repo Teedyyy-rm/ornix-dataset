@@ -49,10 +49,13 @@ HANDOFF_FIELDS: Tuple[str, ...] = (
 )
 
 # A handoff license must be a real identifier. These sentinels mean "we do not
-# actually know", and a production handoff must never emit them.
+# actually know", and a production handoff must never emit them. Matched
+# case-insensitively; the repo's own operator-declared sentinel is exactly
+# "UNSPECIFIED-OPERATOR-DECLARED" (see configs/ornix_campaign*.yaml).
 _UNKNOWN_LICENSES = {
     "UNKNOWN", "UNLICENSED", "NONE", "NULL", "N/A", "NA", "",
-    "SPECIMEN", "UNKNOWN-OPERATOR-DECLARED",
+    "SPECIMEN", "UNSPECIFIED", "UNSPECIFIED-OPERATOR-DECLARED",
+    "UNKNOWN-OPERATOR-DECLARED",
 }
 _UNKNOWN_CONSENT = {
     "UNKNOWN", "UNSPECIFIED", "UNLICENSED", "NONE", "NULL", "N/A", "NA", "",

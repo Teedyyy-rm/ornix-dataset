@@ -353,5 +353,10 @@ def test_canonical_loader_vs_hf_audiofolder(tmp_path):
     except Exception as exc:  # builder/decoder not provisioned
         pytest.skip(f"audiofolder unavailable: {exc}")
     feat = dd["train"].features
-    assert "file_name" in feat
     assert feat["audio"].__class__.__name__ == "Audio"  # cast, not str
+    # `file_name` used to be mirrored by the AudioFolder builder, but newer
+    # `datasets` releases drop it (verified absent on 4.8.5). That is exactly the
+    # divergence this test documents, so assert the loader contract and the
+    # audio cast only; never assert a third-party builder's column list.
+    if "file_name" in feat:
+        assert dd["train"][0]["file_name"] == row["file_name"]

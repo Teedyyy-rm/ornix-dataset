@@ -182,10 +182,19 @@ def test_unknown_license_rejected(tmp_path):
     assert "license" in rep["handoff"]["reason"]
 
 
-@pytest.mark.parametrize("bad", ["UNLICENSED", "NONE", "NULL", ""])
+@pytest.mark.parametrize("bad", ["UNKNOWN", "UNLICENSED", "NONE", "NULL", ""])
 def test_blank_or_unknown_license_sentinels_rejected(tmp_path, bad):
     rep = _export(tmp_path, [_sample(tmp_path, license_id=bad)])
     assert rep["handoff"]["written"] is False
+
+
+def test_repo_operator_declared_sentinel_rejected(tmp_path):
+    # exactly the sentinel configs/ornix_campaign*.yaml uses for a dataset with no
+    # Hub license that the operator merely asserts redistribution rights for
+    rep = _export(tmp_path, [_sample(tmp_path,
+                                     license_id="UNSPECIFIED-OPERATOR-DECLARED")])
+    assert rep["handoff"]["written"] is False
+    assert "license is unknown" in rep["handoff"]["reason"]
 
 
 def test_train_only_rights_block_handoff(tmp_path):
