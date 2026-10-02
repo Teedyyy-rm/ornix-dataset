@@ -556,6 +556,7 @@ class OrnixPipeline:
             segment_start_sample_source=a, segment_end_sample_source=b,
             rights_record_id="RIGHTS_" + short_id(src.source_id, length=10),
             source_license=src.source_license,
+            consent_scope=getattr(src, "consent_scope", "") or "",
             rights_status=src.rights_status.value,
             redistribution_permitted=bool(src.redistribution_permitted),
             quality_evidence_id=seg_id, quality_policy_version=self.policy.policy_version,

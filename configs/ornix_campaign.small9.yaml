@@ -26,6 +26,13 @@
 #    2026-09-27), conservatively commercial "false", license
 #    "UNSPECIFIED-OPERATOR-DECLARED".
 #
+# consent_scope is the OPERATOR-DECLARED verified consent scope carried onto every
+# accepted row and into the Ornix-TTS handoff manifest (manifest.jsonl). It
+# follows the declared `commercial` flag, never the license shape:
+#   commercial "true"  -> research-and-commercial
+#   commercial "false" -> research   (covers every NC / unspecified source)
+# Never inferred by the tool.
+#
 # fpt_fosd CAVEAT (measured, not assumed): its parquet embeds MP3 payloads
 # (original names are *.mp3). The extractor sniffs the real container from the
 # magic bytes, and the source-admission gate MEASURES the decoded codec and
@@ -48,7 +55,7 @@ datasets:
     parquet_prefix: data
     text_col: transcription
     speaker: {mode: fixed, ref: thanh_pham}
-    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: CC-BY-NC-SA-4.0, note: "ThanhPahm-TTS CC-BY-NC-SA-4.0; attribution + NC + share-alike"}
+    rights: {consent_scope: research, status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: CC-BY-NC-SA-4.0, note: "ThanhPahm-TTS CC-BY-NC-SA-4.0; attribution + NC + share-alike"}
 
   - name: ngochuyen_vivoice
     repo: thangnzt/NgocHuyenViVoice
@@ -56,7 +63,7 @@ datasets:
     parquet_prefix: data
     text_col: text
     speaker: {mode: fixed, ref: ngoc_huyen_vivoice}
-    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "true", license: MIT, note: "NgocHuyenViVoice MIT"}
+    rights: {consent_scope: research-and-commercial, status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "true", license: MIT, note: "NgocHuyenViVoice MIT"}
 
   - name: ngochuyen_voice
     repo: pnnbao-ump/ngochuyen_voice
@@ -64,7 +71,7 @@ datasets:
     parquet_prefix: data
     text_col: transcription
     speaker: {mode: fixed, ref: ngoc_huyen_voice}
-    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: CC-BY-NC-4.0, note: "ngochuyen_voice CC-BY-NC-4.0; NC"}
+    rights: {consent_scope: research, status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: CC-BY-NC-4.0, note: "ngochuyen_voice CC-BY-NC-4.0; NC"}
 
   - name: vietbiblevox
     repo: ntt123/VietBibleVox-aligned
@@ -72,7 +79,7 @@ datasets:
     parquet_prefix: ""
     text_col: text
     speaker: {mode: fixed, ref: thanh_nam}
-    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "true", license: CC-BY-SA-4.0, note: "VietBibleVox-aligned CC-BY-SA-4.0; share-alike"}
+    rights: {consent_scope: research-and-commercial, status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "true", license: CC-BY-SA-4.0, note: "VietBibleVox-aligned CC-BY-SA-4.0; share-alike"}
 
   - name: fpt_fosd
     repo: doof-ferb/fpt_fosd
@@ -80,7 +87,7 @@ datasets:
     parquet_prefix: ""
     text_col: transcription
     speaker: {mode: none}
-    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "true", license: CC-BY-4.0, note: "fpt_fosd CC-BY-4.0; parquet embeds MP3 - codec measured at admission"}
+    rights: {consent_scope: research-and-commercial, status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "true", license: CC-BY-4.0, note: "fpt_fosd CC-BY-4.0; parquet embeds MP3 - codec measured at admission"}
 
   - name: hatrang_voice
     repo: quocs/hatrang-voice-4h
@@ -91,7 +98,7 @@ datasets:
     text_col: transcription
     file_col: file_name
     speaker: {mode: fixed, ref: ha_trang}
-    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: UNSPECIFIED-OPERATOR-DECLARED, note: "no Hub license; operator asserts redistribution rights 2026-09-25"}
+    rights: {consent_scope: research, status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: UNSPECIFIED-OPERATOR-DECLARED, note: "no Hub license; operator asserts redistribution rights 2026-09-25"}
 
   - name: luna_vi
     repo: TuNguyen1101/luna_vi
@@ -102,7 +109,7 @@ datasets:
     text_col: text
     file_col: file_name
     speaker: {mode: fixed, ref: luna}
-    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: UNSPECIFIED-OPERATOR-DECLARED, note: "no Hub license; operator asserts redistribution rights 2026-09-27"}
+    rights: {consent_scope: research, status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: UNSPECIFIED-OPERATOR-DECLARED, note: "no Hub license; operator asserts redistribution rights 2026-09-27"}
 
   - name: vi_voice_female
     repo: vuihocrnd/vi_voice_female
@@ -110,7 +117,7 @@ datasets:
     parquet_prefix: data
     text_col: text_norm
     speaker: {mode: fixed, ref: hong_hanh}
-    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: UNSPECIFIED-OPERATOR-DECLARED, note: "no Hub license; operator asserts redistribution rights 2026-09-27"}
+    rights: {consent_scope: research, status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "false", license: UNSPECIFIED-OPERATOR-DECLARED, note: "no Hub license; operator asserts redistribution rights 2026-09-27"}
 
   - name: w2wmovie_voice_2
     repo: thanghp456/W2WMovie-Voice-2
@@ -118,4 +125,4 @@ datasets:
     parquet_prefix: data
     text_col: text
     speaker: {mode: fixed, ref: hong_ngan}
-    rights: {status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "true", license: MIT, note: "W2WMovie-Voice-2 MIT"}
+    rights: {consent_scope: research-and-commercial, status: REDISTRIBUTION_APPROVED, redistribute: true, commercial: "true", license: MIT, note: "W2WMovie-Voice-2 MIT"}

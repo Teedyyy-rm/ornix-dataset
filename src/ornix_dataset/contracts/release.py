@@ -30,6 +30,8 @@ class ReleaseRow:
     release_id: str
     # rights carried onto every published row (spec §0.2.6 — gated != redistributable)
     source_license: str = "UNKNOWN"
+    # Operator-declared consent scope carried to the Ornix-TTS handoff.
+    consent_scope: str = ""
     rights_status: str = "UNKNOWN"
     redistribution_permitted: bool = False
     # canonical-normalization provenance (spec §4/§5): which source identity this

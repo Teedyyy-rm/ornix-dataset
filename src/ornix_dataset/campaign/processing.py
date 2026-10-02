@@ -84,6 +84,9 @@ def _job_rights_fields(job: Any) -> Dict[str, Any]:
             "attribution_required": bool(rights.get("attribution_required", True)),
             "rights_owner": rights.get("owner"),
             "consent_reference": rights.get("consent_reference"),
+            # Verified consent scope for the Ornix-TTS handoff; declared by the
+            # operator in the campaign manifest, never inferred.
+            "consent_scope": str(rights.get("consent_scope") or ""),
             "license_evidence_uri": rights.get("evidence_uri")}
 
 

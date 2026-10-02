@@ -28,8 +28,8 @@ from ornix_dataset.util.hashing import sha256_file
 def _sample(root, name="a.wav", *, text="xin chào thế giới", lang="vi",
             speaker_ref="speaker_01", scope="hf://datasets/org/A@rev1",
             sid="SRC_1", ssha="a" * 64, rights="REDISTRIBUTION_APPROVED",
-            red=True, split="train", license_id="CC-BY-4.0", dur=2.0, seed=1,
-            sr=24000, sub=""):
+            red=True, split="train", license_id="CC-BY-4.0", consent="",
+            dur=2.0, seed=1, sr=24000, sub=""):
     src_dir = root / "src" / sub
     src_dir.mkdir(parents=True, exist_ok=True)
     wav = src_dir / name
@@ -41,7 +41,8 @@ def _sample(root, name="a.wav", *, text="xin chào thế giới", lang="vi",
         rights_status=rights, redistribution_permitted=red,
         transcript_verified=True, language_verified=True,
         source_uri=scope, source_revision="rev1", original_file_id=name,
-        audio_sha256=sha256_file(str(wav)), source_license=license_id)
+        audio_sha256=sha256_file(str(wav)), source_license=license_id,
+        consent_scope=consent)
 
 
 def _export(root, samples, **kw):
@@ -173,6 +174,32 @@ def test_release_manifest_jsonl_not_written_by_handoff(tmp_path):
 
 
 # --- validation (fail-closed) -------------------------------------------------
+
+def test_declared_consent_scope_is_used(tmp_path):
+    _export(tmp_path, [_sample(tmp_path, consent="research-and-commercial")])
+    row = _read(tmp_path)[0]
+    assert row["consent"] == "research-and-commercial"
+
+
+def test_declared_consent_scope_reaches_provenance(tmp_path):
+    _export(tmp_path, [_sample(tmp_path, consent="research")])
+    state = json.load(open(os.path.join(str(tmp_path / "state"),
+                                        "ornix_state.json")))
+    scopes = {p["consent_scope"] for p in state["provenance"].values()}
+    assert scopes == {"research"}
+
+
+def test_blank_consent_falls_back_to_redistribution_default(tmp_path):
+    _export(tmp_path, [_sample(tmp_path, consent="")])
+    assert _read(tmp_path)[0]["consent"] == "redistribution-approved"
+
+
+@pytest.mark.parametrize("bad", ["UNKNOWN", "UNSPECIFIED", "UNLICENSED", "NONE"])
+def test_explicit_unknown_consent_rejected(tmp_path, bad):
+    rep = _export(tmp_path, [_sample(tmp_path, consent=bad)])
+    assert rep["handoff"]["written"] is False
+    assert "consent is unknown" in rep["handoff"]["reason"]
+
 
 def test_unknown_license_rejected(tmp_path):
     _export(tmp_path, [_sample(tmp_path, license_id="UNKNOWN")])

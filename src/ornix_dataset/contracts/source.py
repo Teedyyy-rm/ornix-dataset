@@ -35,6 +35,10 @@ class SourceRecord:
     license_evidence_uri: Optional[str] = None
     rights_owner: Optional[str] = None
     consent_reference: Optional[str] = None
+    # Operator-declared verified consent scope (redistribution | research |
+    # commercial | ...). Empty means "not declared"; the Ornix-TTS handoff then
+    # falls back to its conservative redistribution default.
+    consent_scope: str = ""
     rights_status: RightsStatus = RightsStatus.UNKNOWN
     redistribution_permitted: bool = False
     commercial_training_permitted: str = "UNKNOWN"  # true|false|UNKNOWN

@@ -87,7 +87,9 @@ def sample_from_accepted_row(row: Dict[str, Any], canonical_dir: str,
         audio_sha256=row.get("audio_sha256", ""),
         quality_evidence_id=row.get("quality_evidence_id", ""),
         quality_policy_version=row.get("quality_policy_version", ""),
-        source_license=row.get("source_license", "UNKNOWN"))
+        source_license=row.get("source_license", "UNKNOWN"),
+        consent_scope=row.get("consent_scope", "") or
+                      sidecar.get("consent_scope", ""))
 
 
 def export_run(workdir: str, run_id: str, dataset_dir: str, state_dir: str,

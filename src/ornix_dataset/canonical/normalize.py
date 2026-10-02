@@ -58,6 +58,10 @@ class SampleInput:
     quality_evidence_id: str = ""
     quality_policy_version: str = ""
     source_license: str = "UNKNOWN"
+    # Verified consent scope for the Ornix-TTS handoff (e.g. "redistribution",
+    # "research", "commercial"). Empty means no operator-declared scope; the
+    # handoff then falls back to its conservative redistribution default.
+    consent_scope: str = ""
 
 
 def _blocker(sample: SampleInput, reason: str) -> Dict[str, Any]:
@@ -180,6 +184,7 @@ def normalize_samples(samples: List[SampleInput], dataset_dir: str,
                 "rights_status": sample.rights_status,
                 "redistribution_permitted": sample.redistribution_permitted,
                 "source_license": sample.source_license,
+                "consent_scope": sample.consent_scope,
                 "transcript": sample.text, "language": row.language,
                 "speaker": speaker, "split": sample.split,
                 "source_speaker_ref": sample.speaker_ref})
