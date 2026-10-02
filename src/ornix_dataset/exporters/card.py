@@ -4,13 +4,19 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from ..canonical.card import hub_license
+
 
 def render_dataset_card(release_id: str, rows: List[Dict[str, Any]],
                         rights_report: Dict[str, Any], quality_report: Dict[str, Any],
                         changelog: str = "") -> str:
     langs = sorted({r.get("language", "vi") for r in rows})
     splits = sorted({r.get("split", "train") for r in rows})
-    licenses = sorted({v for v in rights_report.get("licenses", [])}) or ["see-source-terms"]
+    # The Hub rejects the whole commit when a frontmatter license id is not one
+    # of its known values, and it only accepts lowercase SPDX-ish ids. Reuse the
+    # canonical mapping so a release card and a canonical card never disagree.
+    licenses = sorted({hub_license(v) for v in rights_report.get("licenses", [])}) \
+        or ["other"]
     n = len(rows)
     total_hours = round(sum(r.get("duration_s", 0) for r in rows) / 3600.0, 4)
     fm = [
