@@ -682,9 +682,7 @@ def cmd_campaign_fanout_publish(args) -> int:
     from .campaign import CampaignStore
     from .campaign.fanout import fanout_releases, write_approvals
     from .campaign.processing import qc_paths
-    from .campaign.publishing import publish_release
-    from .publishing.hf import staging_revision_for
-    from .campaign.publishing import path_prefix_for
+    from .campaign.publishing import path_prefix_for, publish_release, staging_revision_for
 
     store = CampaignStore(args.root)
     campaign = store.load_campaign()
